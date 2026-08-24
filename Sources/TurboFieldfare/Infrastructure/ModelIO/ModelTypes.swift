@@ -104,6 +104,40 @@ public struct ArchConfig: Sendable, Equatable {
         for i in stride(from: 5, to: 30, by: 6) { mask[i] = 1 }
         return mask
     }
+
+    /// Canonical Qwen 3.5 35B-A3B baseline, mirroring the manifest the
+    /// repacker writes for `mlx-community/Qwen3.5-35B-A3B-4bit`. The family is
+    /// recognized so installs select the right tokenizer and fail with a
+    /// precise error; the executable forward pass is Gemma-only.
+    public static let qwen3_5_35B_A3B = ArchConfig(
+        hiddenSize: 2048,
+        intermediateSize: 512,
+        moeIntermediateSize: 512,
+        numHeads: 16,
+        numKVHeads: 2,
+        numFullKVHeads: 2,
+        headDim: 256,
+        fullHeadDim: 256,
+        vocabSize: 248_320,
+        slidingWindow: 1024,
+        finalLogitSoftcap: 30.0,
+        ropeTheta: 10_000.0,
+        fullRopeTheta: 1_000_000.0,
+        partialRotaryFactor: 0.25,
+        numLayers: 40,
+        numExperts: 256,
+        topKExperts: 8,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: Self.qwen35LayerMask(),
+        hiddenActivation: "gelu_pytorch_tanh"
+    )
+
+    private static func qwen35LayerMask() -> [UInt8] {
+        var mask = [UInt8](repeating: 0, count: 40)
+        for i in stride(from: 3, to: 40, by: 4) { mask[i] = 1 }
+        return mask
+    }
 }
 
 /// Failure modes for the validation gates in `Model.load`.

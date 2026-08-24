@@ -18,6 +18,13 @@ enum ServerLog {
         write("request \(id) generating")
     }
 
+    static func prefill(id: String,
+                       done: Int,
+                       total: Int) {
+        write("request \(id) prefill in \(done) "
+            + "tokens=\(total)")
+    }
+
     static func completed(id: String,
                           duration: Duration,
                           completion: ServerCompletion) {

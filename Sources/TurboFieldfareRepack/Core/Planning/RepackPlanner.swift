@@ -122,7 +122,10 @@ enum RepackPlanner {
     }
 
     private static func routedExpertRole(in name: String) -> String? {
-        guard name.contains(".experts.switch_glu.") else { return nil }
+        // 检查是否包含 ".mlp.switch_mlp."（Qwen）或 ".experts.switch_glu."（Gemma）
+        guard name.contains(".mlp.switch_mlp.") || name.contains(".experts.switch_glu.") else {
+            return nil
+        }
         if name.contains(".gate_proj.") { return "gate" }
         if name.contains(".up_proj.")   { return "up" }
         if name.contains(".down_proj.") { return "down" }

@@ -28,6 +28,8 @@ public final class RepackModelInstallerClient: AppModelInstallerClient, Sendable
         self.runInstall = { outputDirectory, progress in
             let paths = try RemoteInstallPaths(outputDirectory: outputDirectory.path)
             let resume = FileManager.default.fileExists(atPath: paths.checkpointFile)
+            let mirrorURL = ProcessInfo.processInfo.environment["HF_ENDPOINT"]
+                .flatMap { URL(string: $0) } ?? URL(string: "https://huggingface.co")!
             let options = RemoteStreamingRepackOptions(
                 repoID: descriptor.repoID,
                 revision: descriptor.revision,
@@ -36,7 +38,8 @@ public final class RepackModelInstallerClient: AppModelInstallerClient, Sendable
                 requireKnownSource: true,
                 minFreeReserveBytes: descriptor.reserveBytes,
                 overwrite: true,
-                resume: resume)
+                resume: resume,
+                baseURL: mirrorURL)
             let result = try await RemoteStreamingRepacker(options: options).run(progress: progress)
             return URL(fileURLWithPath: result.outputDir).standardizedFileURL
         }

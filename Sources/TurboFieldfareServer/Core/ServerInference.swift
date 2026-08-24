@@ -5,6 +5,7 @@ import TurboFieldfare
 public enum ServerInferenceEvent: Equatable, Sendable {
     case content(String)
     case toolCall(ParsedToolCall)
+    case prefill(Int, Int)
 }
 
 public struct ServerCompletion: Equatable, Sendable {
@@ -374,6 +375,26 @@ public actor ServerCoordinator {
     public var isActive: Bool { active }
 }
 
+/// Failures raised while binding an installed `.gturbo` model to a session.
+public enum ServerModelLoadError: Error, CustomStringConvertible, Equatable {
+    case missingTokenizerSidecar(family: ModelFamily)
+    case unsupportedArchitecture(family: ModelFamily, tokenizerVerified: Bool)
+
+    public var description: String {
+        switch self {
+        case .missingTokenizerSidecar(let family):
+            return "recognized \(family.rawValue) install but its tokenizer sidecar is missing; "
+                + "reinstall the model"
+        case .unsupportedArchitecture(let family, let tokenizerVerified):
+            let prefix = tokenizerVerified
+                ? "recognized \(family.rawValue) install with a loadable tokenizer,"
+                : "recognized \(family.rawValue) install,"
+            return prefix + " but this runtime cannot execute that architecture yet; "
+                + "only \(ModelFamily.gemma4_26B_A4B.rawValue) inference is implemented"
+        }
+    }
+}
+
 public actor ServerModelSession: ServerInferenceBackend {
     private let context: MetalContext
     private let model: Model
@@ -390,6 +411,21 @@ public actor ServerModelSession: ServerInferenceBackend {
                             maxContext: Int,
                             promptCacheMode: ServerPromptCacheMode = .singlePrefix,
                             runtimeConfiguration: RuntimeConfiguration) async throws -> ServerModelSession {
+        let family = try ModelFamily.detect(modelDirectory: modelDirectory)
+        switch family {
+        case .gemma4_26B_A4B:
+            break
+        case .qwen3_5_35B_A3B:
+            // Route the Qwen sidecar through Qwen3Tokenizer so an incomplete
+            // install is reported as such, then refuse execution explicitly:
+            // this family has no forward pass in the runtime yet.
+            guard let qwenFolder = Qwen3Tokenizer.tokenizerFolder(forModelDirectory: modelDirectory) else {
+                throw ServerModelLoadError.missingTokenizerSidecar(family: family)
+            }
+            _ = try await Qwen3Tokenizer.load(from: qwenFolder)
+            throw ServerModelLoadError.unsupportedArchitecture(family: family,
+                                                               tokenizerVerified: true)
+        }
         let tokenizerFolder = GFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
         guard let tokenizerFolder else {
             throw GFTokenizerError.missingToolTemplate
@@ -566,8 +602,9 @@ public actor ServerModelSession: ServerInferenceBackend {
                         }
                     }
                     switch progress {
-                    case .prefill:
-                        break
+                    case .prefill(let done, let total):
+                        onEvent(.prefill(done, total))
+                        //break
                     case .token(_, let tokenID, let delta):
                         let events = if let decoder {
                             try decoder.consume(tokenID: tokenID, delta: delta)

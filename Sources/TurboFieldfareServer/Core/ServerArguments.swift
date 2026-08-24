@@ -28,7 +28,7 @@ public struct ServerArguments: Equatable, Sendable {
       --expert-cache-policy <s>  Expert-cache policy: lfu or lru (default lfu).
       --prefill on|off           Enable or disable chunked prompt prefill (default on).
                                  Chunked prefill requires 16 or more cache slots.
-      --prefill-chunk-tokens <n> Prefill chunk size: 32, 64, or 128 (default 128).
+      --prefill-chunk-tokens <n> Prefill chunk size: 32, 64, 128，or 256 (default 128).
       --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive
                                  (default off).
       --help                     Show this help.
@@ -133,7 +133,7 @@ public struct ServerArguments: Equatable, Sendable {
             case "--prefill-chunk-tokens":
                 guard let parsed = Int(value),
                       RuntimeConfiguration.allowedPrefillChunkTokens.contains(parsed) else {
-                    throw ServerArgumentError.invalid("--prefill-chunk-tokens must be 32, 64, or 128")
+                    throw ServerArgumentError.invalid("--prefill-chunk-tokens must be 32, 64, 128, or 256")
                 }
                 prefillChunkTokens = parsed
             case "--rdadvise":

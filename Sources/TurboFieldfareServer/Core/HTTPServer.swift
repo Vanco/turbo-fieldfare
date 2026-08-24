@@ -53,7 +53,7 @@ public actor TurboFieldfareHTTPServer {
                 }
             }
             .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-        let channel = try await bootstrap.bind(host: "127.0.0.1", port: port).get()
+        let channel = try await bootstrap.bind(host: "0.0.0.0", port: port).get()
         self.channel = channel
         return channel
     }
@@ -269,6 +269,8 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                                                        created: created,
                                                        toolIndex: streamState.nextToolIndex(),
                                                        call: call)
+                                case .prefill(let done, let total):
+                                    ServerLog.prefill(id: responseID, done: done, total: total)
                                 }
                             }
                     })

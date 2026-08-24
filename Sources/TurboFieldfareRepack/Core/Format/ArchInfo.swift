@@ -58,24 +58,30 @@ struct ArchInfo: Sendable, Equatable {
         let kEqV = (tc["attention_k_eq_v"] as? Bool) ?? false
         let tie = (tc["tie_word_embeddings"] as? Bool) ?? false
         let act = (tc["hidden_activation"] as? String) ?? "gelu_pytorch_tanh"
+        let slidingWindow = (tc["sliding_windows"] as? Int) ?? 1024
+        let logitSC = (tc["final_logit_softcapping"] as? Double) ?? 30.0
+        func fallbackInt(_ key: String, _ fallbackKey: String) throws -> Int {
+                do { return try i(key) } catch { return try i(fallbackKey) }
+            }
+
         return ArchInfo(
             hiddenSize: try i("hidden_size"),
-            intermediateSize: try i("intermediate_size"),
+            intermediateSize: try fallbackInt("intermediate_size", "shared_expert_intermediate_size"),
             moeIntermediateSize: try i("moe_intermediate_size"),
             numHeads: try i("num_attention_heads"),
             numKVHeads: try i("num_key_value_heads"),
-            numFullKVHeads: try i("num_global_key_value_heads"),
+            numFullKVHeads: try fallbackInt("num_global_key_value_heads", "num_key_value_heads"),
             headDim: try i("head_dim"),
-            fullHeadDim: try i("global_head_dim"),
+            fullHeadDim: try fallbackInt("global_head_dim", "head_dim"),
             vocabSize: try i("vocab_size"),
-            slidingWindow: try i("sliding_window"),
-            finalLogitSoftcap: try d("final_logit_softcapping"),
+            slidingWindow: slidingWindow,
+            finalLogitSoftcap: logitSC,
             ropeTheta: swaTheta,
             fullRopeTheta: fullTheta,
             partialRotaryFactor: prf,
             numLayers: try i("num_hidden_layers"),
             numExperts: try i("num_experts"),
-            topKExperts: try i("top_k_experts"),
+            topKExperts: try fallbackInt("top_k_experts", "num_experts_per_tok"),
             tieWordEmbeddings: tie,
             attentionKEqV: kEqV,
             fullAttentionLayerMask: mask,

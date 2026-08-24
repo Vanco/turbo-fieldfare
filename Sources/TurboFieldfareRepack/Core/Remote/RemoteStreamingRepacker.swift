@@ -1,4 +1,5 @@
 import Foundation
+
 public struct RemoteStreamingRepackOptions: Sendable {
     public let repoID: String
     public let revision: String
@@ -17,22 +18,24 @@ public struct RemoteStreamingRepackOptions: Sendable {
     public let rangeRetryAttempts: Int
     public let retryBaseDelayNs: UInt64
 
-    public init(repoID: String,
-                revision: String,
-                outputDir: String,
-                token: String? = nil,
-                requireKnownSource: Bool = false,
-                copyAuditPath: String? = nil,
-                rangeChunkBytes: Int = RemoteChunkPolicy.defaultBytes,
-                writeTileBytes: Int = WriterCore.tileBytes,
-                minFreeReserveBytes: UInt64 = 1 * 1024 * 1024 * 1024,
-                overwrite: Bool = false,
-                resume: Bool = false,
-                dryRunSpaceCheck: Bool = false,
-                downloadSession: RemoteDownloadSession = RemoteDownloadSession(),
-                baseURL: URL = URL(string: "https://huggingface.co")!,
-                rangeRetryAttempts: Int = 4,
-                retryBaseDelayNs: UInt64 = 1_000_000_000) {
+    public init(
+        repoID: String,
+        revision: String,
+        outputDir: String,
+        token: String? = nil,
+        requireKnownSource: Bool = false,
+        copyAuditPath: String? = nil,
+        rangeChunkBytes: Int = RemoteChunkPolicy.defaultBytes,
+        writeTileBytes: Int = WriterCore.tileBytes,
+        minFreeReserveBytes: UInt64 = 1 * 1024 * 1024 * 1024,
+        overwrite: Bool = false,
+        resume: Bool = false,
+        dryRunSpaceCheck: Bool = false,
+        downloadSession: RemoteDownloadSession = RemoteDownloadSession(),
+        baseURL: URL = URL(string: "https://huggingface.co")!,
+        rangeRetryAttempts: Int = 4,
+        retryBaseDelayNs: UInt64 = 1_000_000_000
+    ) {
         self.repoID = repoID
         self.revision = revision
         self.outputDir = outputDir
@@ -70,21 +73,26 @@ public final class RemoteStreamingRepacker {
     private let audit: RepackAudit
     private let startTime = Date()
 
-    public init(options: RemoteStreamingRepackOptions,
-                audit: RepackAudit = RepackAudit()) {
+    public init(
+        options: RemoteStreamingRepackOptions,
+        audit: RepackAudit = RepackAudit()
+    ) {
         self.options = options
         self.audit = audit
     }
 
-    public func run(progress: @escaping @Sendable (ModelInstallProgress) -> Void = { _ in }) async throws
-        -> RemoteStreamingRepackResult {
+    public func run(progress: @escaping @Sendable (ModelInstallProgress) -> Void = { _ in })
+        async throws
+        -> RemoteStreamingRepackResult
+    {
         try validateOptions()
         let installLock = try InstallLock.acquire(outputDirectory: options.outputDir)
         defer { withExtendedLifetime(installLock) {} }
         let paths = installLock.paths
         if try Posix.entryKind(paths.finalDirectory) == .directory, !options.overwrite {
-            throw RepackError.configurationInvalid(detail:
-                "output directory already exists: \(paths.finalDirectory)")
+            throw RepackError.configurationInvalid(
+                detail:
+                    "output directory already exists: \(paths.finalDirectory)")
         }
         let hasPartial = try Posix.entryKind(paths.partialDirectory) == .directory
         let hasCheckpoint = try Posix.entryKind(paths.checkpointFile) == .regular
@@ -105,7 +113,8 @@ public final class RemoteStreamingRepacker {
             return try await runPrepared(paths: paths, progress: progress)
         } catch {
             if !hasCheckpoint,
-               (try? Posix.entryKind(paths.checkpointFile)) != .regular {
+                (try? Posix.entryKind(paths.checkpointFile)) != .regular
+            {
                 try? FileManager.default.removeItem(atPath: paths.partialDirectory)
             }
             throw error
@@ -322,7 +331,23 @@ public final class RemoteStreamingRepacker {
         let layoutPath = ((paths.partialDirectory as NSString)
             .appendingPathComponent("packed_experts") as NSString)
             .appendingPathComponent("layout.json")
-        let expertStride = plan.layers.first(where: { $0.expertsPerLayer > 0 })?.expertStride ?? 0
+        // 从 plan 中获取专家步长（假设 plan 有 expertStride 属性，或者计算）
+        let expertStride: UInt64
+        if let firstLayer = plan.layers.first(where: { $0.expertsPerLayer > 0 }) {
+            // 使用该层的 expertStride，并确保对齐到页大小
+            let base = firstLayer.expertStride
+            // 对齐到页大小（假设 Layout.pageBytes 是 16384）
+            expertStride =
+                ((base + UInt64(Layout.pageBytes) - 1) / UInt64(Layout.pageBytes))
+                * UInt64(Layout.pageBytes)
+        } else {
+            expertStride = UInt64(Layout.pageBytes)  // 默认值
+        }
+        print("=== DEBUG: expertStride = \(expertStride)")
+        print("=== DEBUG: plan.layers.count = \(plan.layers.count)")
+        for (idx, layer) in plan.layers.enumerated() {
+            print("layer \(idx): expertsPerLayer=\(layer.expertsPerLayer), expertStride=\(layer.expertStride), fileSize=\(layer.fileSize)")
+        }
         let layoutData = try GTurboJSON.encodeLayout(plan: plan, expertStride: expertStride)
         try writeSmall(path: layoutPath, data: layoutData)
         try GTurboLayoutValidator.validate(path: layoutPath, plan: plan)

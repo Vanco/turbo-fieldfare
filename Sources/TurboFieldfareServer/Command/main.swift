@@ -31,7 +31,7 @@ do {
         queueLimit: arguments.queueLimit,
         backend: backend)
     _ = try await server.start(port: arguments.port)
-    print("TurboFieldfareServer ready at http://127.0.0.1:\(arguments.port) model=\(arguments.modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue)")
+    print("TurboFieldfareServer ready at http://0.0.0.0:\(arguments.port) model=\(arguments.modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue)")
 
     _ = await signals.wait()
     try await server.shutdown()

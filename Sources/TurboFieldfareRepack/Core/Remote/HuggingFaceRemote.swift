@@ -58,6 +58,9 @@ public struct HuggingFaceRemoteSource: Sendable {
         try validateFilename(filename)
         let revision = resolvedCommit ?? requestedRevision
         var url = baseURL
+        if baseURL.host?.contains("modelscope.cn") == true {
+            url.appendPathComponent("models")
+        }
         for part in repoID.split(separator: "/") {
             url.appendPathComponent(String(part))
         }
