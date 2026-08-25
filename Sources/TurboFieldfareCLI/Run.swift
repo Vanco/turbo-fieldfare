@@ -17,10 +17,32 @@ public func run(args: Args,
                 stderr: FileHandle = .standardError) async -> RunResult {
     do {
         let modelURL = URL(fileURLWithPath: args.model)
-        let tokenizer = try await GFTokenizer.load(forModelDirectory: modelURL)
+        let family = try ModelFamily.detect(modelDirectory: modelURL)
+
+        let tokenizer: any Tokenizing
+        switch family {
+        case .gemma4_26B_A4B:
+            let folder = GFTokenizer.tokenizerFolder(forModelDirectory: modelURL)!
+            tokenizer = try await GFTokenizer.load(from: folder)
+        case .qwen3_5_35B_A3B:
+            let folder = Qwen3Tokenizer.tokenizerFolder(forModelDirectory: modelURL)!
+            tokenizer = try await Qwen3Tokenizer.load(from: folder)
+        }
+
         let promptIds: [Int32]
-        if let rawPrompt = args.prompt {
-            promptIds = tokenizer.encode(rawPrompt, addBOS: true)
+        if let tokenIDs = args.tokenIDs {
+            promptIds = tokenIDs
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .compactMap { Int32($0) }
+        } else if let rawPrompt = args.prompt {
+            if family == .qwen3_5_35B_A3B {
+                let messages = [GFTokenizer.Message(role: .user, content: rawPrompt)]
+                let rendered = try tokenizer.applyChatTemplate(messages)
+                promptIds = tokenizer.encode(rendered, addBOS: false)
+            } else {
+                promptIds = tokenizer.encode(rawPrompt, addBOS: true)
+            }
         } else if let messagesFile = args.messagesFile {
             let data = try Data(contentsOf: URL(fileURLWithPath: messagesFile),
                                 options: [.mappedIfSafe])
@@ -34,7 +56,7 @@ public func run(args: Args,
             let rendered = try tokenizer.applyChatTemplate(messages)
             promptIds = tokenizer.encode(rendered, addBOS: false)
         } else {
-            return errored(stderr, "one of --prompt or --messages-file is required", 2)
+            return errored(stderr, "one of --prompt, --messages-file, or --token-ids is required", 2)
         }
         guard !promptIds.isEmpty else { return errored(stderr, "empty prompt", 2) }
         guard promptIds.count < args.maxContext else {
@@ -44,8 +66,9 @@ public func run(args: Args,
                 2)
         }
         let effectiveMaxNew = min(args.maxNew, args.maxContext - promptIds.count)
+        let logitsOnly = args.logitsOut != nil
         let config = GenerationConfig(
-            maxNewTokens: effectiveMaxNew,
+            maxNewTokens: logitsOnly ? 1 : effectiveMaxNew,
             temperature: args.temperature,
             topK: args.topK,
             topP: args.topP,
@@ -63,16 +86,28 @@ public func run(args: Args,
         let model = try Model.load(
             directoryURL: modelURL,
             device: context.device,
+            expecting: family.archConfig,
             streamingMode: .pread(slotCount: runtime.expertCacheSlots),
             expertCachePolicy: runtime.modelExpertCachePolicy,
             integrityPolicy: .fullSha256)
-        let runner = try RealForwardRunner(
-            model: model,
-            context: context,
-            maxContext: args.maxContext,
-            runtimeConfiguration: runtime)
+        let runner: any LogitProducer
+        switch family {
+        case .gemma4_26B_A4B:
+            runner = try RealForwardRunner(
+                model: model,
+                context: context,
+                maxContext: args.maxContext,
+                runtimeConfiguration: runtime)
+        case .qwen3_5_35B_A3B:
+            runner = try Qwen35ForwardRunner(
+                model: model,
+                context: context,
+                maxContext: args.maxContext,
+                runtimeConfiguration: runtime)
+        }
         let scratch = try RawCompletionScratch(context: context,
                                                vocab: model.config.vocabSize)
+        let logitsURL = args.logitsOut.map { URL(fileURLWithPath: $0) }
         let stats = try await runRawCompletion(
             producer: runner,
             tokenizer: tokenizer,
@@ -80,7 +115,8 @@ public func run(args: Args,
             config: config,
             context: context,
             scratch: scratch,
-            prefillConfig: runtime.prefillConfig) { progress in
+            prefillConfig: runtime.prefillConfig,
+            onProgress: { progress in
                 switch progress {
                 case .prefill:
                     break
@@ -89,7 +125,15 @@ public func run(args: Args,
                 case .tail(let tail):
                     stdout.write(Data(tail.utf8))
                 }
-            }
+            },
+            onPrefillLogits: { buffer in
+                guard let url = logitsURL else { return }
+                let vocab = model.config.vocabSize
+                let ptr = buffer.contents().bindMemory(to: Float16.self, capacity: vocab)
+                var floats = [Float32](repeating: 0, count: vocab)
+                for i in 0..<vocab { floats[i] = Float32(ptr[i]) }
+                try? floats.withUnsafeBytes { try Data($0).write(to: url) }
+            })
 
         if !args.quiet {
             let tokensPerSecond = stats.decodeSeconds > 0

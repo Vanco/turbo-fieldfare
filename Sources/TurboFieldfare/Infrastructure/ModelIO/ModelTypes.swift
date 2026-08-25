@@ -25,6 +25,19 @@ public struct ArchConfig: Sendable, Equatable {
     public let attentionKEqV: Bool
     public let fullAttentionLayerMask: [UInt8]
     public let hiddenActivation: String
+    /// Coarse family identity. Baselines carry their own family; the default
+    /// keeps hand-built configs on the production Gemma path.
+    public let family: ModelFamily
+    // Gated-delta-net linear-attention geometry (Qwen 3.5). All zero/false for
+    // families without linear layers.
+    public let linearNumKeyHeads: Int
+    public let linearNumValueHeads: Int
+    public let linearHeadDim: Int
+    public let linearConvKernelDim: Int
+    /// Qwen 3.5 full-attention output gating (`attn_output_gate`): q_proj rows
+    /// are [head | gate] halves and attention output is multiplied by
+    /// sigmoid(gate) per head before o_proj.
+    public let attentionOutputGate: Bool
 
     public init(
         hiddenSize: Int,
@@ -47,7 +60,13 @@ public struct ArchConfig: Sendable, Equatable {
         tieWordEmbeddings: Bool,
         attentionKEqV: Bool,
         fullAttentionLayerMask: [UInt8],
-        hiddenActivation: String
+        hiddenActivation: String,
+        family: ModelFamily = .gemma4_26B_A4B,
+        linearNumKeyHeads: Int = 0,
+        linearNumValueHeads: Int = 0,
+        linearHeadDim: Int = 0,
+        linearConvKernelDim: Int = 0,
+        attentionOutputGate: Bool = false
     ) {
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
@@ -70,6 +89,20 @@ public struct ArchConfig: Sendable, Equatable {
         self.attentionKEqV = attentionKEqV
         self.fullAttentionLayerMask = fullAttentionLayerMask
         self.hiddenActivation = hiddenActivation
+        self.family = family
+        self.linearNumKeyHeads = linearNumKeyHeads
+        self.linearNumValueHeads = linearNumValueHeads
+        self.linearHeadDim = linearHeadDim
+        self.linearConvKernelDim = linearConvKernelDim
+        self.attentionOutputGate = attentionOutputGate
+    }
+
+    /// True when non-full layers run the gated-delta-net linear attention.
+    public var usesGatedDeltaNet: Bool { linearConvKernelDim > 0 }
+
+    /// Number of layers whose mask bit is clear (GDN layers for Qwen 3.5).
+    public var linearLayerCount: Int {
+        fullAttentionLayerMask.reduce(0) { $0 + ($1 == 0 ? 1 : 0) }
     }
 
     /// Canonical Gemma 4 26B-A4B baseline, checked against the installed
@@ -105,10 +138,14 @@ public struct ArchConfig: Sendable, Equatable {
         return mask
     }
 
-    /// Canonical Qwen 3.5 35B-A3B baseline, mirroring the manifest the
-    /// repacker writes for `mlx-community/Qwen3.5-35B-A3B-4bit`. The family is
-    /// recognized so installs select the right tokenizer and fail with a
-    /// precise error; the executable forward pass is Gemma-only.
+    /// Canonical Qwen 3.5 35B-A3B baseline (mlx-community/Qwen3.5-35B-A3B-4bit).
+    ///
+    /// The repacker cannot derive every field from this source's flat config,
+    /// so its manifest carries placeholder values for `fullRopeTheta`,
+    /// `ropeTheta`, `slidingWindow`, `finalLogitSoftcap`, and
+    /// `hiddenActivation` (`ManifestReader.validateArch` tolerates exactly
+    /// those mismatches for non-Gemma families). The values below are the true
+    /// runtime semantics from `tokenizer/config.json`.
     public static let qwen3_5_35B_A3B = ArchConfig(
         hiddenSize: 2048,
         intermediateSize: 512,
@@ -120,9 +157,9 @@ public struct ArchConfig: Sendable, Equatable {
         fullHeadDim: 256,
         vocabSize: 248_320,
         slidingWindow: 1024,
-        finalLogitSoftcap: 30.0,
-        ropeTheta: 10_000.0,
-        fullRopeTheta: 1_000_000.0,
+        finalLogitSoftcap: 0.0,          // no logit softcap in Qwen 3.5
+        ropeTheta: 10_000_000.0,
+        fullRopeTheta: 10_000_000.0,
         partialRotaryFactor: 0.25,
         numLayers: 40,
         numExperts: 256,
@@ -130,7 +167,13 @@ public struct ArchConfig: Sendable, Equatable {
         tieWordEmbeddings: false,
         attentionKEqV: false,
         fullAttentionLayerMask: Self.qwen35LayerMask(),
-        hiddenActivation: "gelu_pytorch_tanh"
+        hiddenActivation: "silu",
+        family: .qwen3_5_35B_A3B,
+        linearNumKeyHeads: 16,
+        linearNumValueHeads: 32,
+        linearHeadDim: 128,
+        linearConvKernelDim: 4,
+        attentionOutputGate: true
     )
 
     private static func qwen35LayerMask() -> [UInt8] {

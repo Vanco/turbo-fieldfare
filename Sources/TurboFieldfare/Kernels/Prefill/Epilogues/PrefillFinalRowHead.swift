@@ -62,5 +62,8 @@ final class PrefillFinalRowHeadInt4 {
                     yOffset: logitsOffset,
                     m: vocab,
                     n: d)
+        if ProcessInfo.processInfo.environment["TFDUMP"] != nil {
+            fputs("LMHEAD d=\(d) vocab=\(vocab) wOff=\(weightsOffset) sOff=\(scalesOffset) bOff=\(biasesOffset) normedLen=\(normed.length)\n", stderr)
+        }
     }
 }

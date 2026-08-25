@@ -4,8 +4,9 @@ import Metal
 
 /// Which attention variant a layer runs. Gemma 4 interleaves 25 sliding-window
 /// layers with 5 full-attention layers (the latter carry the K=V shared-tensor
-/// quirk). Sourced from `ArchConfig.fullAttentionLayerMask`.
-public enum LayerKind: Sendable { case swa, full }
+/// quirk). Sourced from `ArchConfig.fullAttentionLayerMask`. Qwen 3.5 keeps
+/// gated-delta-net linear-attention layers in `.none` — they carry no KV state.
+public enum LayerKind: Sendable { case swa, full, none }
 
 /// A read view the attention kernels bind. `offset` stays 0; ring-enabled SWA
 /// layers expose the physical start slot for diagnostics while kernels map
@@ -95,8 +96,11 @@ public final class KVCacheManager {
 
         for layer in 0..<config.numLayers {
             let isFull = config.fullAttentionLayerMask[layer] != 0
+            let isLinearOnly = config.usesGatedDeltaNet && !isFull
             let stride = isFull ? fullStride : swaStride
-            let capacity = ringEnabled && !isFull ? swaCapacity : maxContext
+            let capacity = isLinearOnly
+                ? 1
+                : (ringEnabled && !isFull ? swaCapacity : maxContext)
             let length = capacity * stride
 
             guard let kBuf = device.makeBuffer(length: length, options: .storageModeShared) else {
@@ -112,7 +116,7 @@ public final class KVCacheManager {
             vs.append(vBuf)
 
             st.append(stride)
-            kd.append(isFull ? .full : .swa)
+            kd.append(isFull ? .full : (isLinearOnly ? .none : .swa))
             caps.append(capacity)
         }
 

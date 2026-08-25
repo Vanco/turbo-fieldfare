@@ -87,7 +87,7 @@ struct ServerPromptCache: Sendable {
         domain: ServerPromptCacheDomain,
         request: ValidatedChatRequest,
         renderedPromptIDs: [Int32],
-        tokenizer: GFTokenizer
+        tokenizer: any Tokenizing
     ) -> ServerPromptCacheMatch {
         guard let entry,
               entry.domain == domain,
@@ -151,7 +151,7 @@ struct ServerPromptCache: Sendable {
     private func matchTextContinuation(
         entry: ServerPromptCacheEntry,
         continuation: [GFTokenizer.Message],
-        tokenizer: GFTokenizer
+        tokenizer: any Tokenizing
     ) -> ServerPromptCacheMatch {
         guard continuation.count == 1,
               continuation[0].role == .user,
@@ -177,7 +177,7 @@ struct ServerPromptCache: Sendable {
         entry: ServerPromptCacheEntry,
         request: ValidatedChatRequest,
         continuation: [GFTokenizer.Message],
-        tokenizer: GFTokenizer
+        tokenizer: any Tokenizing
     ) -> ServerPromptCacheMatch {
         let calls = entry.assistantTurn.message.toolCalls
         guard entry.assistantTurn.rawStopReason == .toolCalls,

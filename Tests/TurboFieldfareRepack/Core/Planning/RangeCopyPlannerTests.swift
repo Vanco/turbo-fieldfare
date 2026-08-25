@@ -5,7 +5,7 @@ import Testing
 
 @Suite
 struct RangeCopyPlannerTests {
-    @Test func canonicalFingerprintDoesNotDependOnAbsoluteOutputRoot() throws {
+    @Test func canonicalFingerprintDoesNotDependOnAbsoluteOutputRoot() async throws {
         let snapshotDirectory = temporaryRoot("snapshot")
         let firstOutput = temporaryRoot("first")
         let secondOutput = temporaryRoot("second")
@@ -21,12 +21,12 @@ struct RangeCopyPlannerTests {
         let arch = try ArchInfo.load(
             configPath: (snapshotDirectory as NSString).appendingPathComponent("config.json"))
         let header = try parseHeader(path: snapshot.shardPath)
-        let firstPlan = try RepackPlanner.plan(
+        let firstPlan = try await RepackPlanner.plan(
             meta: metadata,
             arch: arch,
             shardHeaders: [header],
             outputDir: firstOutput)
-        let secondPlan = try RepackPlanner.plan(
+        let secondPlan = try await RepackPlanner.plan(
             meta: metadata,
             arch: arch,
             shardHeaders: [header],

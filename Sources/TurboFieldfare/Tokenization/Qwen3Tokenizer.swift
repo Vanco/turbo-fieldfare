@@ -31,7 +31,7 @@ public enum Qwen3TokenizerError: Error, CustomStringConvertible {
 /// - Uses ChatML format: `<|im_start|>role\n...<|im_end|>`
 /// - Special tokens are resolved from the tokenizer's `added_tokens`.
 /// - Decoding uses the native `Tokenizers` pipeline (skipSpecialTokens = true).
-public struct Qwen3Tokenizer: @unchecked Sendable {
+    public struct Qwen3Tokenizer: @unchecked Sendable, Tokenizing {
 
     public static let defaultModelID = "Qwen/Qwen3-5B"
 
@@ -162,24 +162,19 @@ public struct Qwen3Tokenizer: @unchecked Sendable {
 
     // MARK: - Chat Template (ChatML)
 
-    public enum Role: String, Sendable { case system, user, assistant }
-
-    public struct Message: Sendable, Equatable {
-        public let role: Role
-        public let content: String
-
-        public init(role: Role, content: String) {
-            self.role = role
-            self.content = content
-        }
-    }
+    public typealias Role = ChatRole
+    public typealias Message = ChatMessage
 
     /// Apply ChatML format: `<|im_start|>role\ncontent<|im_end|>` repeated, ending with `<|im_start|>assistant\n`.
-    public func applyChatTemplate(_ messages: [Message], addGenerationPrompt: Bool = true) throws -> String {
+    public func applyChatTemplate(_ messages: [Message]) throws -> String {
+        try applyChatTemplate(messages, addGenerationPrompt: true)
+    }
+
+    private func applyChatTemplate(_ messages: [Message], addGenerationPrompt: Bool) throws -> String {
         var result = ""
         for message in messages {
             let role = message.role.rawValue
-            let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            let content = (message.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             result += "<|im_start|>\(role)\n\(content)<|im_end|>\n"
         }
         if addGenerationPrompt {
@@ -198,6 +193,80 @@ public struct Qwen3Tokenizer: @unchecked Sendable {
     public func encodeUserPrompt(_ userContent: String) -> [Int32] {
         let messages = [Message(role: .user, content: userContent)]
         return (try? encodeChat(messages, addGenerationPrompt: true)) ?? []
+    }
+
+    // MARK: - Tokenizing protocol (Qwen)
+
+    public var toolCallStartID: Int32 { imStartID }
+    public var toolCallEndID: Int32 { imEndID }
+    public var toolResponseID: Int32 { imEndID }
+    public var toolResponseEndID: Int32 { imEndID }
+    public var endOfTurnID: Int32 { imEndID }
+    public var channelStartID: Int32 { -1 }
+    public var channelEndID: Int32 { -1 }
+    public var structuralMarkerIDs: Set<Int32> { [imEndID] }
+
+    public func encodeTextContinuation(userContent: String) -> [Int32] {
+        let content = userContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = "<|im_end|>\n<|im_start|>user\n\(content)<|im_end|>\n<|im_start|>assistant\n"
+        return encode(text, addBOS: false)
+    }
+
+    public func encodeToolChat(messages: [ChatMessage],
+                               tools: [ChatFunctionDefinition]) throws -> [Int32] {
+        throw Qwen3TokenizerError.invalidChatTemplate(
+            "tool-call chat encoding is not yet implemented for Qwen in this runtime")
+    }
+
+    public func encodeToolResultContinuation(cachedMessages: [ChatMessage],
+                                             assistant: ChatMessage,
+                                             incomingMessages: [ChatMessage],
+                                             tools: [ChatFunctionDefinition]) throws -> [Int32] {
+        throw Qwen3TokenizerError.invalidChatTemplate(
+            "tool-call continuation is not yet implemented for Qwen in this runtime")
+    }
+
+    public func makeDetokenizer(barrierTokenIDs: Set<Int32>) -> any Detokenizing {
+        QwenDetokenizer(tokenizer: self, barrierTokenIDs: barrierTokenIDs)
+    }
+}
+
+/// Streaming detokenizer for Qwen3: re-decodes the accumulated id buffer on each
+/// push and emits the newly produced suffix. O(n^2) but correct; the Qwen
+/// decoder is the upstream `Tokenizers` pipeline, so a true incremental path is
+/// not available here.
+struct QwenDetokenizer: Detokenizing {
+    let tokenizer: Qwen3Tokenizer
+    let skipSpecialTokens: Bool
+    let barrierTokenIDs: Set<Int32>
+    private var buffer: [Int32] = []
+    private var lastText: String = ""
+
+    init(tokenizer: Qwen3Tokenizer, skipSpecialTokens: Bool = true, barrierTokenIDs: Set<Int32> = []) {
+        self.tokenizer = tokenizer
+        self.skipSpecialTokens = skipSpecialTokens
+        self.barrierTokenIDs = barrierTokenIDs
+    }
+
+    mutating func push(_ id: Int32) -> String {
+        buffer.append(id)
+        return emitDelta()
+    }
+
+    mutating func flush() -> String {
+        return emitDelta()
+    }
+
+    private mutating func emitDelta() -> String {
+        let full = tokenizer.decode(buffer, skipSpecialTokens: skipSpecialTokens)
+        if full.hasPrefix(lastText) {
+            let delta = String(full[lastText.endIndex...])
+            lastText = full
+            return delta
+        }
+        let delta = full
+        lastText = full
+        return delta
     }
 }
 

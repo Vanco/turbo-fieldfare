@@ -395,11 +395,14 @@ public enum ServerModelLoadError: Error, CustomStringConvertible, Equatable {
     }
 }
 
+/// Protocol composition every forward runner presented to the server must satisfy.
+typealias ForwardRunnerBackend = any ChunkedPrefillRunner & ContextWindowReporting & ContinuableLogitProducer
+
 public actor ServerModelSession: ServerInferenceBackend {
     private let context: MetalContext
     private let model: Model
-    private let tokenizer: GFTokenizer
-    private let runner: RealForwardRunner
+    private let tokenizer: any Tokenizing
+    private let runner: ForwardRunnerBackend
     private let scratch: RawCompletionScratch
     private let prefillConfig: PrefillRuntimeConfig
     private let maxContext: Int
@@ -412,45 +415,58 @@ public actor ServerModelSession: ServerInferenceBackend {
                             promptCacheMode: ServerPromptCacheMode = .singlePrefix,
                             runtimeConfiguration: RuntimeConfiguration) async throws -> ServerModelSession {
         let family = try ModelFamily.detect(modelDirectory: modelDirectory)
+        let tokenizer: any Tokenizing
+        let templateDigest: String
         switch family {
         case .gemma4_26B_A4B:
-            break
+            let tokenizerFolder = GFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
+            guard let tokenizerFolder else {
+                throw GFTokenizerError.missingToolTemplate
+            }
+            let templateURL = tokenizerFolder.appendingPathComponent("chat_template.jinja")
+            guard FileManager.default.fileExists(atPath: templateURL.path) else {
+                throw GFTokenizerError.missingToolTemplate
+            }
+            tokenizer = try await GFTokenizer.load(from: tokenizerFolder)
+            templateDigest = SHA256.hash(data: try Data(contentsOf: templateURL))
+                .map { String(format: "%02x", $0) }
+                .joined()
         case .qwen3_5_35B_A3B:
-            // Route the Qwen sidecar through Qwen3Tokenizer so an incomplete
-            // install is reported as such, then refuse execution explicitly:
-            // this family has no forward pass in the runtime yet.
             guard let qwenFolder = Qwen3Tokenizer.tokenizerFolder(forModelDirectory: modelDirectory) else {
                 throw ServerModelLoadError.missingTokenizerSidecar(family: family)
             }
-            _ = try await Qwen3Tokenizer.load(from: qwenFolder)
-            throw ServerModelLoadError.unsupportedArchitecture(family: family,
-                                                               tokenizerVerified: true)
+            tokenizer = try await Qwen3Tokenizer.load(from: qwenFolder)
+            let templateURL = qwenFolder.appendingPathComponent("tokenizer.json")
+            let templateData = FileManager.default.fileExists(atPath: templateURL.path)
+                ? try Data(contentsOf: templateURL)
+                : Data(qwenFolder.path.utf8)
+            templateDigest = SHA256.hash(data: templateData)
+                .map { String(format: "%02x", $0) }
+                .joined()
         }
-        let tokenizerFolder = GFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
-        guard let tokenizerFolder else {
-            throw GFTokenizerError.missingToolTemplate
-        }
-        let templateURL = tokenizerFolder.appendingPathComponent("chat_template.jinja")
-        guard FileManager.default.fileExists(atPath: templateURL.path) else {
-            throw GFTokenizerError.missingToolTemplate
-        }
-        let tokenizer = try await GFTokenizer.load(from: tokenizerFolder)
         let context = try MetalContext()
         let runtime = runtimeConfiguration
         let model = try Model.load(
             directoryURL: modelDirectory,
             device: context.device,
+            expecting: family.archConfig,
             streamingMode: .pread(slotCount: runtime.expertCacheSlots),
             expertCachePolicy: runtime.modelExpertCachePolicy,
             integrityPolicy: .fullSha256)
-        let runner = try RealForwardRunner(model: model,
+        let runner: ForwardRunnerBackend
+        switch family {
+        case .gemma4_26B_A4B:
+            runner = try RealForwardRunner(model: model,
                                            context: context,
                                            maxContext: maxContext,
                                            runtimeConfiguration: runtime)
+        case .qwen3_5_35B_A3B:
+            runner = try Qwen35ForwardRunner(model: model,
+                                             context: context,
+                                             maxContext: maxContext,
+                                             runtimeConfiguration: runtime)
+        }
         let scratch = try RawCompletionScratch(context: context, vocab: model.config.vocabSize)
-        let templateDigest = SHA256.hash(data: try Data(contentsOf: templateURL))
-            .map { String(format: "%02x", $0) }
-            .joined()
         let runtimeIdentity = [
             String(runtime.expertCacheSlots),
             runtime.expertCachePolicy.rawValue,
@@ -483,8 +499,8 @@ public actor ServerModelSession: ServerInferenceBackend {
 
     private init(context: MetalContext,
                  model: Model,
-                 tokenizer: GFTokenizer,
-                 runner: RealForwardRunner,
+                 tokenizer: any Tokenizing,
+                 runner: ForwardRunnerBackend,
                  scratch: RawCompletionScratch,
                  prefillConfig: PrefillRuntimeConfig,
                  maxContext: Int,

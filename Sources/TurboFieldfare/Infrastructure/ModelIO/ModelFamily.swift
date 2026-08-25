@@ -37,7 +37,7 @@ public enum ModelFamily: String, Sendable, CaseIterable {
 
     /// Whether the runtime implements this family's forward pass today.
     public var supportsRuntimeInference: Bool {
-        self == .gemma4_26B_A4B
+        true
     }
 
     /// Read `manifest.json` far enough to identify the model family.

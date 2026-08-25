@@ -51,7 +51,7 @@ public enum RangeCopyPlanner {
         var copies: [RangeCopy] = []
         copies.reserveCapacity(repackPlan.resident.entries.count * 3)
 
-        for entry in repackPlan.resident.entries {
+        for entry in repackPlan.resident.entries where entry.precomputed == nil {
             copies.append(RangeCopy(shardID: entry.sourceWeight.shardPath,
                                     sourceOffset: entry.sourceWeight.absoluteOffset,
                                     size: entry.sizeBytes,

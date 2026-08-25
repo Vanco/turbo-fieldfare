@@ -32,6 +32,32 @@ struct ResidentEntry: Sendable {
     let sourceWeight: SourceTensor
     let sourceScales: SourceTensor?
     let sourceBiases: SourceTensor?
+
+    /// Precomputed bytes for tensors forced to a fixed dtype (e.g. Qwen GDN
+    /// conv1d/A_log/dt_bias). When non-nil the writer emits these directly as
+    /// an unquantized tensor and ignores the source tensors.
+    let precomputed: Data?
+
+    init(name: String, dtype: UInt8, logicalShape4: [UInt32], fileOffset: UInt64,
+         sizeBytes: UInt64, scaleOffset: UInt64, scaleSize: UInt64,
+         biasOffset: UInt64, biasSize: UInt64, quantSpec: QuantSpec?,
+         sourceWeight: SourceTensor, sourceScales: SourceTensor?,
+         sourceBiases: SourceTensor?, precomputed: Data? = nil) {
+        self.name = name
+        self.dtype = dtype
+        self.logicalShape4 = logicalShape4
+        self.fileOffset = fileOffset
+        self.sizeBytes = sizeBytes
+        self.scaleOffset = scaleOffset
+        self.scaleSize = scaleSize
+        self.biasOffset = biasOffset
+        self.biasSize = biasSize
+        self.quantSpec = quantSpec
+        self.sourceWeight = sourceWeight
+        self.sourceScales = sourceScales
+        self.sourceBiases = sourceBiases
+        self.precomputed = precomputed
+    }
 }
 
 struct ResidentFilePlan: Sendable {
@@ -145,7 +171,9 @@ enum RepackPlanner {
     static func plan(meta: IndexLoader.SourceMetadata,
                             arch: ArchInfo,
                             shardHeaders: [Safetensors.Header],
-                            outputDir: String) throws -> RepackPlan {
+                            outputDir: String,
+                            remote: HuggingFaceRemoteSource? = nil,
+                            remoteFiles: [String: RemoteFileInfo] = [:]) async throws -> RepackPlan {
 
         // Companion tensors may live in different shards, so resolve them
         // through one global registry.
@@ -188,9 +216,10 @@ enum RepackPlanner {
         excludedMultimodalNames.sort()
 
         let residentPath = (outputDir as NSString).appendingPathComponent("model_weights.bin")
-        let resident = try planResidentFile(path: residentPath,
-                                            baseNames: lmResidentBases,
-                                            registry: registry, meta: meta)
+        let resident = try await planResidentFile(path: residentPath,
+                                             baseNames: lmResidentBases,
+                                             registry: registry, meta: meta,
+                                             remote: remote, remoteFiles: remoteFiles)
 
         let layersDir = (outputDir as NSString).appendingPathComponent("packed_experts")
         var layerPlans: [LayerFilePlan] = []
@@ -239,10 +268,12 @@ enum RepackPlanner {
     // MARK: - Resident planning
 
     private static func planResidentFile(path: String,
-                                         baseNames: [String],
-                                         registry: [String: SourceTensor],
-                                         meta: IndexLoader.SourceMetadata) throws
-                                        -> ResidentFilePlan {
+                                          baseNames: [String],
+                                          registry: [String: SourceTensor],
+                                          meta: IndexLoader.SourceMetadata,
+                                          remote: HuggingFaceRemoteSource? = nil,
+                                          remoteFiles: [String: RemoteFileInfo] = [:]) async throws
+                                         -> ResidentFilePlan {
         let entryCount = baseNames.count
 
         var stringTable: [UInt8] = []
@@ -271,7 +302,47 @@ enum RepackPlanner {
             let dtype = ietnyDtype(weight.dtype)
             let isQuantizedPacked = (weight.dtype == .u32) && name.hasSuffix(".weight")
 
-            if isQuantizedPacked {
+            if let target = forcedTargetDType(name) {
+                // Qwen GDN tensors the runtime requires at a fixed precision
+                // (BF16 for conv1d/dt_bias/norm, FP32 for A_log). The source may
+                // store them quantized; dequantize (or convert) to the target
+                // dtype and keep them unquantized so requireBF16/requireFP32 pass.
+                let logical: [UInt64]
+                let data: Data
+                if isQuantizedPacked {
+                    let base = String(name.dropLast(".weight".count))
+                    guard let scales = registry[base + ".scales"] else {
+                        throw RepackError.missingScalesCompanion(name: name)
+                    }
+                    guard let biases = registry[base + ".biases"] else {
+                        throw RepackError.missingBiasesCompanion(name: name)
+                    }
+                    if scales.dtype != .bf16 || biases.dtype != .bf16 {
+                        throw RepackError.dtypeMismatch(name: name,
+                            detail: "expected BF16 scales/biases, got \(scales.dtype)/\(biases.dtype)")
+                    }
+                    let spec = IndexLoader.quantSpec(forTensor: name, meta: meta)
+                    logical = logicalShape(forPackedSource: weight.shape, bits: spec.bits)
+                    data = try await dequantizeResident(name: name, weight: weight, scales: scales,
+                                                  biases: biases, logical: logical,
+                                                  target: target, meta: meta,
+                                                  remote: remote, remoteFiles: remoteFiles)
+                } else {
+                    logical = weight.shape
+                    data = try await convertResident(name: name, weight: weight,
+                                               logical: logical, target: target,
+                                               remote: remote, remoteFiles: remoteFiles)
+                }
+                let off = (fileCursor + 3) & ~UInt64(3)
+                let size = UInt64(data.count)
+                fileCursor = off + size
+                entries.append(ResidentEntry(
+                    name: name, dtype: target, logicalShape4: padTo4(truncateTrailingOnes(logical)),
+                    fileOffset: off, sizeBytes: size,
+                    scaleOffset: 0, scaleSize: 0, biasOffset: 0, biasSize: 0,
+                    quantSpec: nil, sourceWeight: weight, sourceScales: nil,
+                    sourceBiases: nil, precomputed: data))
+            } else if isQuantizedPacked {
                 let base = String(name.dropLast(".weight".count))
                 guard let scales = registry[base + ".scales"] else {
                     throw RepackError.missingScalesCompanion(name: name)
@@ -425,6 +496,17 @@ enum RepackPlanner {
         return out
     }
 
+    /// Drops trailing size-1 dimensions so a tensor like `[8192, 4, 1]` is
+    /// recorded as `[8192, 4]`, matching the 2-D schema the runtime expects for
+    /// GDN conv1d weights. Total element count is unchanged.
+    private static func truncateTrailingOnes(_ s: [UInt64]) -> [UInt64] {
+        var out = s
+        while out.count > 1, let last = out.last, last == 1 {
+            out.removeLast()
+        }
+        return out
+    }
+
     /// Logical shape of a packed quantized tensor whose source is `[D0,..,Dn-1, Dn/factor]`.
     private static func logicalShape(forPackedSource source: [UInt64], bits: Int) -> [UInt64] {
         let factor = UInt64(32 / bits)
@@ -432,6 +514,191 @@ enum RepackPlanner {
         var out = source
         out[out.count - 1] = source[source.count - 1] * factor
         return out
+    }
+
+    // MARK: - Forced-precision tensors (Qwen GDN)
+
+    /// Tensors the runtime demands at a fixed precision regardless of how the
+    /// source quantized them. Returns the target `GTurboFormatV1.DType` byte, or
+    /// nil to let the normal quant/unquant paths handle the tensor.
+    private static func forcedTargetDType(_ name: String) -> UInt8? {
+        if name.hasSuffix(".linear_attn.A_log") {
+            return GTurboFormatV1.DType.fp32.rawValue
+        }
+        if name.hasSuffix(".linear_attn.conv1d.weight")
+            || name.hasSuffix(".linear_attn.dt_bias")
+            || name.hasSuffix(".linear_attn.norm.weight") {
+            return GTurboFormatV1.DType.bf16.rawValue
+        }
+        return nil
+    }
+
+    private static func readSourceBytes(_ t: SourceTensor,
+                                         remote: HuggingFaceRemoteSource?,
+                                         remoteFiles: [String: RemoteFileInfo]) async throws -> Data {
+        if let remote, let info = remoteFiles[t.shardPath] {
+            let tmp = try await remote.pinned(commit: info.resolvedCommit)
+                .downloadRangeToTempFile(filename: t.shardPath, info: info,
+                                         offset: t.absoluteOffset, length: Int(t.sizeBytes))
+            defer { try? FileManager.default.removeItem(atPath: tmp.path) }
+            let data = try Data(contentsOf: URL(fileURLWithPath: tmp.path))
+            guard data.count == Int(t.sizeBytes) else {
+                throw RepackError.remoteBodyTruncated(
+                    path: t.shardPath, expected: t.sizeBytes, actual: UInt64(data.count))
+            }
+            return data
+        }
+        let handle = try MmapHandle(path: t.shardPath)
+        let slice = handle.slice(at: t.absoluteOffset, count: Int(t.sizeBytes))
+        return Data(bytes: slice.baseAddress!, count: Int(t.sizeBytes))
+    }
+
+    private static func dequantizeResident(name: String, weight: SourceTensor,
+                                           scales: SourceTensor, biases: SourceTensor,
+                                           logical: [UInt64], target: UInt8,
+                                           meta: IndexLoader.SourceMetadata,
+                                           remote: HuggingFaceRemoteSource?,
+                                           remoteFiles: [String: RemoteFileInfo]) async throws -> Data {
+        _ = meta
+        let wBytes = try await readSourceBytes(weight, remote: remote, remoteFiles: remoteFiles)
+        let sBytes = try await readSourceBytes(scales, remote: remote, remoteFiles: remoteFiles)
+        let bBytes = try await readSourceBytes(biases, remote: remote, remoteFiles: remoteFiles)
+        let logicalCount = Int(logical.reduce(1, *))
+        let targetFP32 = target == GTurboFormatV1.DType.fp32.rawValue
+        return dequantizeInt4ToFloating(weightBytes: wBytes, scalesBytes: sBytes,
+                                        biasesBytes: bBytes, logicalCount: logicalCount,
+                                        targetFP32: targetFP32)
+    }
+
+    private static func convertResident(name: String, weight: SourceTensor,
+                                        logical: [UInt64], target: UInt8,
+                                        remote: HuggingFaceRemoteSource?,
+                                        remoteFiles: [String: RemoteFileInfo]) async throws -> Data {
+        _ = logical
+        let src = try await readSourceBytes(weight, remote: remote, remoteFiles: remoteFiles)
+        let count = src.count / weight.dtype.elementBytes
+        let targetFP32 = target == GTurboFormatV1.DType.fp32.rawValue
+        return convertFloating(srcData: src, srcDType: weight.dtype, count: count,
+                                targetFP32: targetFP32)
+    }
+
+    /// Dequantize unsigned int4 (low nibble of byte k = element 2k, high nibble
+    /// = element 2k+1; value = nibble*scale + bias) to BF16 or FP32, matching
+    /// the runtime convention in `dequant_int4.metal`.
+    private static func dequantizeInt4ToFloating(weightBytes: Data,
+                                                 scalesBytes: Data,
+                                                 biasesBytes: Data,
+                                                 logicalCount: Int,
+                                                 targetFP32: Bool) -> Data {
+        let groupSize = 64
+        if targetFP32 {
+            var out = Data(count: logicalCount * 4)
+            out.withUnsafeMutableBytes { ob in
+                let o = ob.bindMemory(to: Float.self)
+                weightBytes.withUnsafeBytes { wb in
+                    scalesBytes.withUnsafeBytes { sb in
+                        biasesBytes.withUnsafeBytes { bb in
+                            let w = wb.bindMemory(to: UInt8.self)
+                            let s = sb.bindMemory(to: UInt16.self)
+                            let b = bb.bindMemory(to: UInt16.self)
+                            for i in 0..<logicalCount {
+                                let byte = w[i / 2]
+                                let nibble = (i & 1) == 0 ? UInt32(byte & 0x0F) : UInt32(byte >> 4)
+                                let g = i / groupSize
+                                let scale = bf16ToFloat(s[g])
+                                let bias = bf16ToFloat(b[g])
+                                o[i] = Float(nibble) * scale + bias
+                            }
+                        }
+                    }
+                }
+            }
+            return out
+        } else {
+            var out = Data(count: logicalCount * 2)
+            out.withUnsafeMutableBytes { ob in
+                let o = ob.bindMemory(to: UInt16.self)
+                weightBytes.withUnsafeBytes { wb in
+                    scalesBytes.withUnsafeBytes { sb in
+                        biasesBytes.withUnsafeBytes { bb in
+                            let w = wb.bindMemory(to: UInt8.self)
+                            let s = sb.bindMemory(to: UInt16.self)
+                            let b = bb.bindMemory(to: UInt16.self)
+                            for i in 0..<logicalCount {
+                                let byte = w[i / 2]
+                                let nibble = (i & 1) == 0 ? UInt32(byte & 0x0F) : UInt32(byte >> 4)
+                                let g = i / groupSize
+                                let scale = bf16ToFloat(s[g])
+                                let bias = bf16ToFloat(b[g])
+                                let value = Float(nibble) * scale + bias
+                                o[i] = floatToBF16(value)
+                            }
+                        }
+                    }
+                }
+            }
+            return out
+        }
+    }
+
+    /// Reinterpret already-unquantized floating source bytes into BF16 or FP32.
+    private static func convertFloating(srcData: Data, srcDType: SourceTensor.Dtype,
+                                        count: Int, targetFP32: Bool) -> Data {
+        if targetFP32 {
+            var out = Data(count: count * 4)
+            out.withUnsafeMutableBytes { ob in
+                let o = ob.bindMemory(to: Float.self)
+                srcData.withUnsafeBytes { sb in
+                    for i in 0..<count {
+                        o[i] = floatValue(srcData: sb, srcDType: srcDType, index: i)
+                    }
+                }
+            }
+            return out
+        } else {
+            var out = Data(count: count * 2)
+            out.withUnsafeMutableBytes { ob in
+                let o = ob.bindMemory(to: UInt16.self)
+                srcData.withUnsafeBytes { sb in
+                    for i in 0..<count {
+                        o[i] = floatToBF16(floatValue(srcData: sb, srcDType: srcDType, index: i))
+                    }
+                }
+            }
+            return out
+        }
+    }
+
+    private static func floatValue(srcData sb: UnsafeRawBufferPointer,
+                                   srcDType: SourceTensor.Dtype, index: Int) -> Float {
+        guard let base = sb.baseAddress else { return 0 }
+        switch srcDType {
+        case .bf16:
+            let p = base.advanced(by: index * 2).assumingMemoryBound(to: UInt16.self)
+            return bf16ToFloat(p.pointee)
+        case .fp16:
+            let p = base.advanced(by: index * 2).assumingMemoryBound(to: UInt16.self)
+            return Float(Float16(bitPattern: p.pointee))
+        case .fp32:
+            let p = base.advanced(by: index * 4).assumingMemoryBound(to: Float.self)
+            return p.pointee
+        default:
+            return 0
+        }
+    }
+
+    private static func bf16ToFloat(_ h: UInt16) -> Float {
+        Float(bitPattern: UInt32(h) << 16)
+    }
+
+    private static func floatToBF16(_ f: Float) -> UInt16 {
+        let bits = f.bitPattern
+        let low = bits & 0xFFFF
+        var result = UInt16((bits >> 16) & 0xFFFF)
+        if low > 0x8000 || (low == 0x8000 && (result & 1) != 0) {
+            result &+= 1
+        }
+        return result
     }
 
     /// Stable order for the resident LM tensor list. Embedding first, then

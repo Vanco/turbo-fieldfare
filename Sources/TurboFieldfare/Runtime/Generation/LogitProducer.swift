@@ -15,7 +15,7 @@ public protocol ContinuableLogitProducer: LogitProducer {
     func prepareForContinuation(expectedPosition: Int) throws
 }
 
-protocol ContextWindowReporting: Sendable {
+public protocol ContextWindowReporting: Sendable {
     var maxContext: Int { get }
 }
 
@@ -39,7 +39,7 @@ public struct PrefillResult: Sendable, Equatable {
     }
 }
 
-protocol ChunkedPrefillRunner: LogitProducer {
+public protocol ChunkedPrefillRunner: LogitProducer {
     /// Prefill a prompt slice using the chunked production runtime.
     func prefillChunked(tokens: ArraySlice<Int32>,
                         startPosition: Int,

@@ -38,7 +38,7 @@ public enum GFTokenizerError: Error, CustomStringConvertible {
 /// TurboFieldfare owns the minimal chat framing because the upstream
 /// `tokenizer_config.json` has no `chat_template`. Literal control-token text in
 /// user content is accepted as a trusted-input research-runtime limitation.
-public struct GFTokenizer: @unchecked Sendable {
+public struct GFTokenizer: @unchecked Sendable, Tokenizing {
     public static let modelID = "google/gemma-4-26B-A4B-it"
     public static let chatTemplateIdentity = "gemma4-it-text-no-tools-v1"
     public static let toolChatTemplateIdentity = "gemma4-it-tools-jinja-v1"
@@ -249,58 +249,10 @@ public struct GFTokenizer: @unchecked Sendable {
 
     // MARK: - Chat template
 
-    public enum Role: String, Sendable { case system, developer, user, assistant, tool }
-    public struct HistoricalToolCall: Sendable, Equatable {
-        public let id: String
-        public let name: String
-        public let arguments: JSONValue
-
-        public init(id: String, name: String, arguments: JSONValue) {
-            self.id = id
-            self.name = name
-            self.arguments = arguments
-        }
-    }
-
-    public struct FunctionDefinition: Sendable, Equatable {
-        public let name: String
-        public let description: String
-        public let parameters: JSONValue
-
-        public init(name: String, description: String, parameters: JSONValue) {
-            self.name = name
-            self.description = description
-            self.parameters = parameters
-        }
-    }
-
-    public struct Message: Sendable, Equatable {
-        public let role: Role
-        public let content: String?
-        public let toolCalls: [HistoricalToolCall]
-        public let toolCallID: String?
-        public let name: String?
-
-        public init(role: Role, content: String) {
-            self.role = role
-            self.content = content
-            self.toolCalls = []
-            self.toolCallID = nil
-            self.name = nil
-        }
-
-        public init(role: Role,
-                    content: String?,
-                    toolCalls: [HistoricalToolCall] = [],
-                    toolCallID: String? = nil,
-                    name: String? = nil) {
-            self.role = role
-            self.content = content
-            self.toolCalls = toolCalls
-            self.toolCallID = toolCallID
-            self.name = name
-        }
-    }
+    public typealias Role = ChatRole
+    public typealias HistoricalToolCall = ChatHistoricalToolCall
+    public typealias FunctionDefinition = ChatFunctionDefinition
+    public typealias Message = ChatMessage
 
     /// Text-only, no-tool rendering of the pinned IT checkpoint's bundled
     /// `chat_template.jinja`, with thinking disabled. Keeping this narrow makes
@@ -457,5 +409,11 @@ private actor GFTokenizerLoadCoordinator {
             tasks[source] = nil
             throw error
         }
+    }
+}
+
+extension GFTokenizer {
+    public func makeDetokenizer(barrierTokenIDs: Set<Int32>) -> any Detokenizing {
+        GFDetokenizer(tokenizer: self, barrierTokenIDs: barrierTokenIDs)
     }
 }

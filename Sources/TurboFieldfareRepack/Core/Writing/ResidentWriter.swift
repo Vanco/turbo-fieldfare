@@ -23,18 +23,27 @@ enum ResidentWriter {
         // 3. For each entry, copy the weight + scales + biases from the source
         // shards in tile-bounded pwrites.
         for e in plan.entries {
-            try copyOne(srcTensor: e.sourceWeight, dstFd: fd, dstPath: plan.path,
-                        dstOffset: e.fileOffset, sizeBytes: e.sizeBytes,
-                        shardsByPath: &shardsByPath, audit: audit)
-            if let scales = e.sourceScales {
-                try copyOne(srcTensor: scales, dstFd: fd, dstPath: plan.path,
-                            dstOffset: e.scaleOffset, sizeBytes: e.scaleSize,
+            if let pre = e.precomputed {
+                try pre.withUnsafeBytes { raw in
+                    guard let base = raw.baseAddress else { return }
+                    try Posix.pwriteAll(fd: fd, path: plan.path, buf: base,
+                                        count: pre.count, offset: e.fileOffset)
+                }
+                audit.recordWrite(bytes: pre.count)
+            } else {
+                try copyOne(srcTensor: e.sourceWeight, dstFd: fd, dstPath: plan.path,
+                            dstOffset: e.fileOffset, sizeBytes: e.sizeBytes,
                             shardsByPath: &shardsByPath, audit: audit)
-            }
-            if let biases = e.sourceBiases {
-                try copyOne(srcTensor: biases, dstFd: fd, dstPath: plan.path,
-                            dstOffset: e.biasOffset, sizeBytes: e.biasSize,
-                            shardsByPath: &shardsByPath, audit: audit)
+                if let scales = e.sourceScales {
+                    try copyOne(srcTensor: scales, dstFd: fd, dstPath: plan.path,
+                                dstOffset: e.scaleOffset, sizeBytes: e.scaleSize,
+                                shardsByPath: &shardsByPath, audit: audit)
+                }
+                if let biases = e.sourceBiases {
+                    try copyOne(srcTensor: biases, dstFd: fd, dstPath: plan.path,
+                                dstOffset: e.biasOffset, sizeBytes: e.biasSize,
+                                shardsByPath: &shardsByPath, audit: audit)
+                }
             }
         }
 

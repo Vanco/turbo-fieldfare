@@ -18,9 +18,9 @@ public struct VerifyInstallResult: Sendable {
 }
 
 public enum VerifiedInstallTool {
-    public static let metadataMaxBytes: UInt64 = 16 * 1024 * 1024
+    public static let metadataMaxBytes: UInt64 = 64 * 1024 * 1024
     public static let manifestMaxBytes: UInt64 = 4 * 1024 * 1024
-    public static let layoutMaxBytes: UInt64 = 16 * 1024 * 1024
+    public static let layoutMaxBytes: UInt64 = 64 * 1024 * 1024
 
     public static func run(options: VerifyInstallOptions) throws -> VerifyInstallResult {
         let root = URL(fileURLWithPath: options.inputGTurbo).standardizedFileURL

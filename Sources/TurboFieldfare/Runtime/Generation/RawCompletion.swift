@@ -37,7 +37,7 @@ public struct RawDecodeResult: Sendable {
 /// `@unchecked Sendable`: the buffers and sampler are exclusively owned by one
 /// generation at a time — the single-in-flight guard upstream is the contract.
 public struct RawCompletionScratch: @unchecked Sendable {
-    let logits: MTLBuffer
+    public let logits: MTLBuffer
     let probs: MTLBuffer
     let outToken: MTLBuffer
     let sampler: Sampler
@@ -79,7 +79,7 @@ extension GenerationConfig {
 /// and reads `lastGreedyToken`. Callers with sampling configs must construct
 /// the runner with `forceLogitsHead: true`.
 public func runRawCompletion(producer: any LogitProducer,
-                             tokenizer: GFTokenizer,
+                             tokenizer: any Tokenizing,
                              promptIds: [Int32],
                              config: GenerationConfig,
                              context: MetalContext,
@@ -87,7 +87,8 @@ public func runRawCompletion(producer: any LogitProducer,
                              prefillConfig: PrefillRuntimeConfig = .defaultChunked,
                              start: RawCompletionStart = .reset,
                              shouldStop: () -> Bool = { false },
-                             onProgress: (RawDecodeProgress) -> Void) async throws -> RawDecodeResult {
+                             onProgress: (RawDecodeProgress) -> Void,
+                             onPrefillLogits: (MTLBuffer) -> Void = { _ in }) async throws -> RawDecodeResult {
     try config.validate()
     guard !promptIds.isEmpty else {
         throw GeneratorError.emptyPrompt
@@ -116,8 +117,7 @@ public func runRawCompletion(producer: any LogitProducer,
     }
     let computedPrefillTokens = promptIds.count - cachedPromptTokens
 
-    var detok = GFDetokenizer(tokenizer: tokenizer,
-                              barrierTokenIDs: tokenizer.structuralMarkerIDs)
+    var detok = tokenizer.makeDetokenizer(barrierTokenIDs: tokenizer.structuralMarkerIDs)
     var history = Array(promptIds.prefix(cachedPromptTokens))
     history.reserveCapacity(promptIds.count + config.maxNewTokens)
 
@@ -175,6 +175,7 @@ public func runRawCompletion(producer: any LogitProducer,
 
     let decodeStart = Date()
     let prefillSeconds = decodeStart.timeIntervalSince(prefillStart)
+    onPrefillLogits(scratch.logits)
     var stopMatcher = StreamingStopMatcher(stops: config.stopStrings)
     var generated = 0
     var reason: StopReason = .maxTokens

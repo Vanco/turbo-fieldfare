@@ -4,6 +4,8 @@ public struct Args: Equatable, Sendable {
     public var model: String
     public var prompt: String?
     public var messagesFile: String?
+    public var tokenIDs: String?
+    public var logitsOut: String?
     public var maxNew: Int
     public var maxContext: Int
     public var temperature: Float
@@ -22,6 +24,8 @@ public struct Args: Equatable, Sendable {
     public init(model: String,
                 prompt: String? = nil,
                 messagesFile: String? = nil,
+                tokenIDs: String? = nil,
+                logitsOut: String? = nil,
                 maxNew: Int = 1_024,
                 maxContext: Int = 4096,
                 temperature: Float = 0.2,
@@ -39,6 +43,8 @@ public struct Args: Equatable, Sendable {
         self.model = model
         self.prompt = prompt
         self.messagesFile = messagesFile
+        self.tokenIDs = tokenIDs
+        self.logitsOut = logitsOut
         self.maxNew = maxNew
         self.maxContext = maxContext
         self.temperature = temperature
@@ -138,6 +144,8 @@ extension Args {
         var model: String?
         var prompt: String?
         var messagesFile: String?
+        var tokenIDs: String?
+        var logitsOut: String?
         var maxNew = 1_024
         var maxContext = 4096
         var temperature: Float = 0.2
@@ -169,6 +177,10 @@ extension Args {
                 prompt = try takeValue(argv, &index, flag: flag)
             case "--messages-file":
                 messagesFile = try takeValue(argv, &index, flag: flag)
+            case "--token-ids":
+                tokenIDs = try takeValue(argv, &index, flag: flag)
+            case "--logits-out":
+                logitsOut = try takeValue(argv, &index, flag: flag)
             case "--max-new":
                 let value = try takeValue(argv, &index, flag: flag)
                 guard let parsed = Int(value), parsed > 0 else {
@@ -255,7 +267,13 @@ extension Args {
         if prompt != nil && messagesFile != nil {
             throw ArgsError.mutuallyExclusive("--prompt", "--messages-file")
         }
-        if prompt == nil && messagesFile == nil { throw ArgsError.modeMissing }
+        if prompt != nil && tokenIDs != nil {
+            throw ArgsError.mutuallyExclusive("--prompt", "--token-ids")
+        }
+        if messagesFile != nil && tokenIDs != nil {
+            throw ArgsError.mutuallyExclusive("--messages-file", "--token-ids")
+        }
+        if prompt == nil && messagesFile == nil && tokenIDs == nil { throw ArgsError.modeMissing }
         if temperature > 0, topK == nil, let topP, topP < 1 {
             throw ArgsError.invalidValue(
                 flag: "--top-p",
@@ -264,6 +282,8 @@ extension Args {
         let arguments = Args(model: model,
                              prompt: prompt,
                              messagesFile: messagesFile,
+                             tokenIDs: tokenIDs,
+                             logitsOut: logitsOut,
                              maxNew: maxNew,
                              maxContext: maxContext,
                              temperature: temperature,

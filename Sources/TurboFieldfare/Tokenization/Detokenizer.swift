@@ -1,6 +1,16 @@
 import Foundation
 import Tokenizers
 
+/// Streaming detokenizer abstraction used by the generation loop. `GFDetokenizer`
+/// (Gemma) and `QwenDetokenizer` (Qwen) both conform; `Tokenizing.makeDetokenizer`
+/// picks the right backend for the active model family.
+public protocol Detokenizing {
+    mutating func push(_ id: Int32) -> String
+    mutating func flush() -> String
+}
+
+extension GFDetokenizer: Detokenizing {}
+
 /// Streaming detokenizer for generation loops. `GFTokenizer.decode` is a
 /// push-loop over this type, so batch and streaming decode agree by
 /// construction.

@@ -158,7 +158,16 @@ public enum ManifestReader {
     }
 
     private static func validateArch(_ a: ManifestArch,
-                                     expected e: ArchConfig) throws {
+                                      expected e: ArchConfig) throws {
+        // Fields the repacker cannot derive from every supported source
+        // config. The Qwen 3.5 source uses a flat `rope_parameters` block and
+        // no softcap/activation keys, so its manifest carries placeholder
+        // values there; the family baseline holds the true runtime semantics.
+        let placeholderTolerated: Set<String> =
+            e.family == .gemma4_26B_A4B
+                ? []
+                : ["slidingWindow", "finalLogitSoftcap", "ropeTheta",
+                   "fullRopeTheta", "hiddenActivation"]
         func check<T: Equatable & CustomStringConvertible>(
             _ field: String, _ actual: T, _ expected: T) throws {
             if actual != expected {
@@ -176,17 +185,27 @@ public enum ManifestReader {
         try check("headDim",             a.headDim,             e.headDim)
         try check("fullHeadDim",         a.fullHeadDim,         e.fullHeadDim)
         try check("vocabSize",           a.vocabSize,           e.vocabSize)
-        try check("slidingWindow",       a.slidingWindow,       e.slidingWindow)
-        try check("finalLogitSoftcap",   a.finalLogitSoftcap,   e.finalLogitSoftcap)
-        try check("ropeTheta",           a.ropeTheta,           e.ropeTheta)
-        try check("fullRopeTheta",       a.fullRopeTheta,       e.fullRopeTheta)
+        if !placeholderTolerated.contains("slidingWindow") {
+            try check("slidingWindow",   a.slidingWindow,       e.slidingWindow)
+        }
+        if !placeholderTolerated.contains("finalLogitSoftcap") {
+            try check("finalLogitSoftcap",   a.finalLogitSoftcap,   e.finalLogitSoftcap)
+        }
+        if !placeholderTolerated.contains("ropeTheta") {
+            try check("ropeTheta",           a.ropeTheta,           e.ropeTheta)
+        }
+        if !placeholderTolerated.contains("fullRopeTheta") {
+            try check("fullRopeTheta",       a.fullRopeTheta,       e.fullRopeTheta)
+        }
         try check("partialRotaryFactor", a.partialRotaryFactor, e.partialRotaryFactor)
         try check("numLayers",           a.numLayers,           e.numLayers)
         try check("numExperts",          a.numExperts,          e.numExperts)
         try check("topKExperts",         a.topKExperts,         e.topKExperts)
         try check("tieWordEmbeddings",   a.tieWordEmbeddings,   e.tieWordEmbeddings)
         try check("attentionKEqV",       a.attentionKEqV,       e.attentionKEqV)
-        try check("hiddenActivation",    a.hiddenActivation,    e.hiddenActivation)
+        if !placeholderTolerated.contains("hiddenActivation") {
+            try check("hiddenActivation",    a.hiddenActivation,    e.hiddenActivation)
+        }
         let actualMask = a.fullAttentionLayerMask.map { UInt8($0) }
         try check("fullAttentionLayerMask",
                   actualMask.description,

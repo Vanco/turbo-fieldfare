@@ -193,10 +193,12 @@ public final class RemoteStreamingRepacker {
                                                            metadataDirectory: paths.metadataDirectory,
                                                            audit: audit)
         try Task.checkCancellation()
-        let plan = try RepackPlanner.plan(meta: snapshot.metadata,
-                                          arch: snapshot.arch,
-                                          shardHeaders: snapshot.shardHeaders,
-                                          outputDir: paths.partialDirectory)
+        let plan = try await RepackPlanner.plan(meta: snapshot.metadata,
+                                           arch: snapshot.arch,
+                                           shardHeaders: snapshot.shardHeaders,
+                                           outputDir: paths.partialDirectory,
+                                           remote: remote.pinned(commit: snapshot.resolvedCommit),
+                                           remoteFiles: snapshot.remoteFiles)
         let rangePlan = try RangeCopyPlanner.plan(repackPlan: plan,
                                                   rangeChunkBytes: options.rangeChunkBytes,
                                                   layoutMode: "identity",
@@ -319,6 +321,7 @@ public final class RemoteStreamingRepacker {
                     parentDirectory: paths.parentDirectory)
             })
 
+        try writePrecomputedResident(plan: plan, partialDir: paths.partialDirectory)
         try recordOutputFile(relativePath: "model_weights.bin",
                              path: plan.resident.path,
                              progress: progress)
@@ -503,8 +506,8 @@ public final class RemoteStreamingRepacker {
     }
 
     private func recordOutputFile(relativePath: String,
-                                  path: String,
-                                  progress: @Sendable (ModelInstallProgress) -> Void) throws {
+                                   path: String,
+                                   progress: @Sendable (ModelInstallProgress) -> Void) throws {
         progress(.hashingOutput(relativePath))
         try Task.checkCancellation()
         let fd = try Posix.openRead(path)
@@ -515,6 +518,28 @@ public final class RemoteStreamingRepacker {
                                                 audit: audit,
                                                 cancellationCheck: Task.checkCancellation)
         audit.outputFiles.append(.init(relativePath: relativePath, size: size, sha256: sha))
+    }
+
+    /// Writes tensors whose bytes were precomputed during planning (e.g. Qwen
+    /// GDN tensors forced to a fixed dtype) directly into the resident output
+    /// file. These are not streamed via range copies, so they must be flushed
+    /// here before the file is hashed and finalized.
+    private func writePrecomputedResident(plan: RepackPlan, partialDir: String) throws {
+        let precomputed = plan.resident.entries.filter { $0.precomputed != nil }
+        guard !precomputed.isEmpty else { return }
+        let path = plan.resident.path
+        let fd = try Posix.openExistingRW(path)
+        defer { close(fd) }
+        for entry in precomputed {
+            guard let bytes = entry.precomputed else { continue }
+            try bytes.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                try Posix.pwriteAll(fd: fd, path: path, buf: base,
+                                    count: bytes.count, offset: entry.fileOffset)
+            }
+            audit.recordWrite(bytes: bytes.count)
+        }
+        try Posix.fsync(fd, path: path)
     }
 
     private func writeSmall(path: String, data: Data) throws {
@@ -607,6 +632,12 @@ public final class RemoteStreamingRepacker {
             }
             if e.name.hasSuffix(".mlp.gate_proj.weight"), let s = e.quantSpec {
                 bits.sharedExpert = s.bits
+            }
+            // Qwen3.5-style shared expert (mlp.shared_expert.{gate,up,down}_proj).
+            // Its tensors never match the generic `.mlp.gate_proj.weight` rule
+            // above, so default to 8-bit and mis-dequantize the 4-bit data.
+            if e.name.hasSuffix(".mlp.shared_expert.gate_proj.weight") {
+                bits.sharedExpert = e.quantSpec?.bits ?? 4
             }
         }
         if let layer = plan.layers.first(where: { !$0.subTensors.isEmpty }),

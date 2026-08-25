@@ -89,9 +89,13 @@ public struct Model {
         try! resident(name: "language_model.model.embed_tokens.weight")
     }
 
-    /// Gemma 4 ties lm_head to the embedding. The transpose for the lm_head
-    /// GEMV path is the kernel's job, not the loader's.
-    public var lmHead: TensorView { embedding }
+    /// Gemma 4 ties lm_head to the embedding; Qwen 3.5 keeps a separate
+    /// `lm_head.weight`. The transpose for the lm_head GEMV path is the
+    /// kernel's job, not the loader's.
+    public var lmHead: TensorView {
+        config.tieWordEmbeddings ? embedding
+            : (try! resident(name: "language_model.lm_head.weight"))
+    }
 
     public func qProj(layer L: Int) throws -> TensorView {
         try resident(name: "language_model.model.layers.\(L).self_attn.q_proj.weight")
@@ -186,6 +190,64 @@ public struct Model {
     /// of the layer; shape `[1]`, BF16.
     public func layerScalar(layer L: Int) throws -> TensorView {
         try resident(name: "language_model.model.layers.\(L).layer_scalar")
+    }
+
+    // MARK: - Qwen 3.5 gated-delta-net linear attention
+    //
+    // Non-full layers replace self_attn with a linear_attn block. The source
+    // layout is non-interleaved: `in_proj_qkv` rows are the contiguous
+    // [q (16 heads x 128) | k (16 x 128) | v (32 x 128)] concatenation, and
+    // `in_proj_z`, `in_proj_a`, `in_proj_b` are separate tensors.
+
+    public func inProjQKV(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.in_proj_qkv.weight")
+    }
+    public func inProjZ(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.in_proj_z.weight")
+    }
+    public func inProjA(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.in_proj_a.weight")
+    }
+    public func inProjB(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.in_proj_b.weight")
+    }
+    /// Depthwise causal conv weight; BF16 `[convDim, kernelDim]` with a
+    /// trailing 1 in shape and no bias term.
+    public func gdnConvWeight(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.conv1d.weight")
+    }
+    /// FP32 `[numValueHeads]`; decay is `exp(-exp(A_log) * softplus(a + dt_bias))`.
+    public func gdnALog(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.A_log")
+    }
+    public func gdnDtBias(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.dt_bias")
+    }
+    /// Per-value-head output RMSNorm weight, BF16 `[linearHeadDim]`.
+    public func gdnNormWeight(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.norm.weight")
+    }
+    /// Qwen 3.5 router lives at `.mlp.gate.weight`.
+    public func qwenRouter(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).mlp.gate.weight")
+    }
+    /// Gated-delta-net output projection: `linear_attn.out_proj.weight` maps the
+    /// per-head GDN output (`num_value_heads * value_head_dim`) back to `hidden`.
+    public func qwenGDNOutProj(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).linear_attn.out_proj.weight")
+    }
+    /// Scalar-gate projection for the shared expert branch; affine `[1, hidden]`.
+    public func sharedExpertGateVec(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).mlp.shared_expert_gate.weight")
+    }
+    public func qwenSharedExpertGate(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).mlp.shared_expert.gate_proj.weight")
+    }
+    public func qwenSharedExpertUp(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).mlp.shared_expert.up_proj.weight")
+    }
+    public func qwenSharedExpertDown(layer L: Int) throws -> TensorView {
+        try resident(name: "language_model.model.layers.\(L).mlp.shared_expert.down_proj.weight")
     }
 
     /// Resolve a tensor name to a `TensorView` against the resident buffer.
@@ -509,6 +571,12 @@ extension Model {
                                       layout: PackedExpertsLayout,
                                       manifest: Manifest,
                                       config: ArchConfig) throws {
+        if config.usesGatedDeltaNet {
+            return try validateRuntimeSchemaQwen(residentIndex: residentIndex,
+                                                 layout: layout,
+                                                 manifest: manifest,
+                                                 config: config)
+        }
         guard let quant = manifest.quant else {
             throw ModelError.indexCorrupt(
                 detail: "manifest.quant is required by the executable runtime schema")
@@ -694,6 +762,199 @@ extension Model {
                     ("\(role)_biases", "BF16",
                      [sizes.shape.0, UInt32(columns / quant.routedExpert.groupSize)],
                      nil, sizes.aux, UInt64(MemoryLayout<UInt16>.alignment)),
+                ]
+                for (name, dtype, shape, bits, size, alignment) in expectedRoles {
+                    guard let expected = reference.subTensors[name] else {
+                        throw ModelError.indexCorrupt(
+                            detail: "routed layer \(layer.layer) is missing role \(name)")
+                    }
+                    let (end, overflow) = expected.offset.addingReportingOverflow(expected.size)
+                    guard expected.dtype == dtype,
+                          expected.shape == shape,
+                          expected.bits == bits,
+                          expected.size == size,
+                          expected.offset % alignment == 0,
+                          !overflow,
+                          end <= reference.size,
+                          end <= UInt64(UInt32.max) + 1 else {
+                        throw ModelError.indexCorrupt(
+                            detail: "routed layer \(layer.layer) role \(name) does not match the required schema")
+                    }
+                    for expert in layer.experts.dropFirst()
+                        where expert.subTensors[name] != expected {
+                        throw ModelError.indexCorrupt(
+                            detail: "routed layer \(layer.layer) role \(name) metadata differs across experts")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Executable resident schema for the Qwen 3.5 35B-A3B layout.
+    ///
+    /// Every affine projection in this install is packed as 4-bit group-64
+    /// affine regardless of the manifest quant slot bits (the source marks
+    /// `mlp.gate` / `shared_expert_gate` as 8-bit, but the writer emits
+    /// int4), so sizes are checked against the actual packing.
+    private static func validateRuntimeSchemaQwen(residentIndex: ResidentIndex,
+                                                  layout: PackedExpertsLayout,
+                                                  manifest: Manifest,
+                                                  config: ArchConfig) throws {
+        guard manifest.quant != nil else {
+            throw ModelError.indexCorrupt(
+                detail: "manifest.quant is required by the executable runtime schema")
+        }
+
+        func requireBF16(_ name: String, count: Int) throws {
+            guard let entry = residentIndex.entries[name] else {
+                throw ModelError.indexCorrupt(detail: "missing required resident tensor \(name)")
+            }
+            guard let logicalCount = UInt32(exactly: count), logicalCount > 0 else {
+                throw ModelError.indexCorrupt(detail: "\(name) has invalid dimensions")
+            }
+            let expectedBytes = UInt64(logicalCount) * UInt64(MemoryLayout<UInt16>.size)
+            guard entry.dtype == GTurboFormatV1.DType.bf16.rawValue,
+                  entry.shape.0 == logicalCount,
+                  entry.sizeBytes == expectedBytes,
+                  entry.scaleSize == 0, entry.biasSize == 0 else {
+                throw ModelError.indexCorrupt(detail: "\(name) does not match the required BF16 schema")
+            }
+        }
+
+        func requireFP32(_ name: String, count: Int) throws {
+            guard let entry = residentIndex.entries[name] else {
+                throw ModelError.indexCorrupt(detail: "missing required resident tensor \(name)")
+            }
+            guard let logicalCount = UInt32(exactly: count), logicalCount > 0 else {
+                throw ModelError.indexCorrupt(detail: "\(name) has invalid dimensions")
+            }
+            let expectedBytes = UInt64(logicalCount) * UInt64(MemoryLayout<Float>.size)
+            guard entry.dtype == GTurboFormatV1.DType.fp32.rawValue,
+                  entry.shape.0 == logicalCount,
+                  entry.sizeBytes == expectedBytes,
+                  entry.scaleSize == 0, entry.biasSize == 0 else {
+                throw ModelError.indexCorrupt(detail: "\(name) does not match the required FP32 schema")
+            }
+        }
+
+        func requireAffineInt4(_ name: String, rows: Int, columns: Int) throws {
+            guard let entry = residentIndex.entries[name] else {
+                throw ModelError.indexCorrupt(detail: "missing required resident tensor \(name)")
+            }
+            let elements = UInt64(rows) * UInt64(columns)
+            let expectedWeight = elements / 2
+            let groups = UInt64(columns / Quantization.groupSize)
+            let expectedAux = UInt64(rows) * groups * UInt64(MemoryLayout<UInt16>.size)
+            guard columns % Quantization.groupSize == 0 else {
+                throw ModelError.indexCorrupt(detail: "\(name) columns are not group-aligned")
+            }
+            guard entry.dtype == GTurboFormatV1.DType.u32.rawValue,
+                  entry.shape.0 == UInt32(rows),
+                  entry.shape.1 == UInt32(columns),
+                  entry.shape.2 == 0, entry.shape.3 == 0,
+                  entry.sizeBytes == expectedWeight,
+                  entry.scaleSize == expectedAux,
+                  entry.biasSize == expectedAux else {
+                throw ModelError.indexCorrupt(
+                    detail: "\(name) affine metadata mismatch: dtype=\(entry.dtype), shape=[\(entry.shape.0),\(entry.shape.1)], bytes=\(entry.sizeBytes), scales=\(entry.scaleSize), biases=\(entry.biasSize); expected int4 shape=[\(rows),\(columns)], bytes=\(expectedWeight), aux=\(expectedAux)")
+            }
+        }
+
+        try requireAffineInt4("language_model.model.embed_tokens.weight",
+                              rows: config.vocabSize, columns: config.hiddenSize)
+        try requireAffineInt4("language_model.lm_head.weight",
+                              rows: config.vocabSize, columns: config.hiddenSize)
+        try requireBF16("language_model.model.norm.weight", count: config.hiddenSize)
+
+        let D = config.hiddenSize
+        let F = config.intermediateSize
+        let fullHeadDim = config.fullHeadDim
+        let gatedQRows = config.numHeads * 2 * fullHeadDim   // [head | gate] halves
+        let attnKVRows = config.numFullKVHeads * fullHeadDim
+        let linKeyHeads = config.linearNumKeyHeads
+        let linValueHeads = config.linearNumValueHeads
+        let linDim = config.linearHeadDim
+        let convDim = (2 * linKeyHeads + linValueHeads) * linDim
+        let kernelDim = config.linearConvKernelDim
+
+        for layer in 0..<config.numLayers {
+            let prefix = "language_model.model.layers.\(layer)"
+            try requireBF16("\(prefix).input_layernorm.weight", count: D)
+            try requireBF16("\(prefix).post_attention_layernorm.weight", count: D)
+
+            if config.fullAttentionLayerMask[layer] != 0 {
+                try requireBF16("\(prefix).self_attn.q_norm.weight", count: fullHeadDim)
+                try requireBF16("\(prefix).self_attn.k_norm.weight", count: fullHeadDim)
+                try requireAffineInt4("\(prefix).self_attn.q_proj.weight",
+                                      rows: gatedQRows, columns: D)
+                try requireAffineInt4("\(prefix).self_attn.k_proj.weight",
+                                      rows: attnKVRows, columns: D)
+                try requireAffineInt4("\(prefix).self_attn.v_proj.weight",
+                                      rows: attnKVRows, columns: D)
+                try requireAffineInt4("\(prefix).self_attn.o_proj.weight",
+                                      rows: D, columns: config.numHeads * fullHeadDim)
+            } else {
+                guard let conv = residentIndex.entries["\(prefix).linear_attn.conv1d.weight"],
+                      conv.dtype == GTurboFormatV1.DType.bf16.rawValue,
+                      conv.shape.0 == UInt32(convDim),
+                      conv.shape.1 == UInt32(kernelDim),
+                      conv.scaleSize == 0, conv.biasSize == 0 else {
+                    throw ModelError.indexCorrupt(
+                        detail: "\(prefix).linear_attn.conv1d.weight does not match the required schema")
+                }
+                try requireFP32("\(prefix).linear_attn.A_log", count: linValueHeads)
+                try requireBF16("\(prefix).linear_attn.dt_bias", count: linValueHeads)
+                try requireBF16("\(prefix).linear_attn.norm.weight", count: linDim)
+                try requireAffineInt4("\(prefix).linear_attn.in_proj_qkv.weight",
+                                      rows: convDim, columns: D)
+                try requireAffineInt4("\(prefix).linear_attn.in_proj_z.weight",
+                                      rows: linValueHeads * linDim, columns: D)
+                try requireAffineInt4("\(prefix).linear_attn.in_proj_a.weight",
+                                      rows: linValueHeads, columns: D)
+                try requireAffineInt4("\(prefix).linear_attn.in_proj_b.weight",
+                                      rows: linValueHeads, columns: D)
+                try requireAffineInt4("\(prefix).linear_attn.out_proj.weight",
+                                      rows: D, columns: linValueHeads * linDim)
+            }
+
+            try requireAffineInt4("\(prefix).mlp.gate.weight",
+                                  rows: config.numExperts, columns: D)
+            try requireAffineInt4("\(prefix).mlp.shared_expert.gate_proj.weight",
+                                  rows: F, columns: D)
+            try requireAffineInt4("\(prefix).mlp.shared_expert.up_proj.weight",
+                                  rows: F, columns: D)
+            try requireAffineInt4("\(prefix).mlp.shared_expert.down_proj.weight",
+                                  rows: D, columns: F)
+            try requireAffineInt4("\(prefix).mlp.shared_expert_gate.weight",
+                                  rows: 1, columns: D)
+        }
+
+        let routedShapes: [(String, Int, Int)] = [
+            ("gate", config.moeIntermediateSize, config.hiddenSize),
+            ("up", config.moeIntermediateSize, config.hiddenSize),
+            ("down", config.hiddenSize, config.moeIntermediateSize),
+        ]
+        guard let quant = manifest.quant else { return }
+        for layer in layout.layers {
+            guard let reference = layer.experts.first else {
+                throw ModelError.indexCorrupt(
+                    detail: "routed layer \(layer.layer) has no experts")
+            }
+            for (role, rows, columns) in routedShapes {
+                let elements = UInt64(rows) * UInt64(columns)
+                let groups = UInt64(columns / quant.routedExpert.groupSize)
+                let weightBytes = elements / 2
+                let auxBytes = UInt64(rows) * groups * UInt64(MemoryLayout<UInt16>.size)
+                let expectedRoles: [(String, String, [UInt32], Int?, UInt64, UInt64)] = [
+                    (role, "U32", [UInt32(rows), UInt32(columns)],
+                     quant.routedExpert.weightBits, weightBytes,
+                     UInt64(MemoryLayout<UInt32>.alignment)),
+                    ("\(role)_scales", "BF16",
+                     [UInt32(rows), UInt32(columns / quant.routedExpert.groupSize)],
+                     nil, auxBytes, UInt64(MemoryLayout<UInt16>.alignment)),
+                    ("\(role)_biases", "BF16",
+                     [UInt32(rows), UInt32(columns / quant.routedExpert.groupSize)],
+                     nil, auxBytes, UInt64(MemoryLayout<UInt16>.alignment)),
                 ]
                 for (name, dtype, shape, bits, size, alignment) in expectedRoles {
                     guard let expected = reference.subTensors[name] else {

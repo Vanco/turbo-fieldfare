@@ -12,7 +12,7 @@ public final class StructuredAssistantDecoder: @unchecked Sendable {
         case label
     }
 
-    private let tokenizer: GFTokenizer
+    private let tokenizer: any Tokenizing
     private let allowedTools: Set<String>
     private let idGenerator: @Sendable () -> String
     private var channel: Channel = .visible
@@ -21,7 +21,7 @@ public final class StructuredAssistantDecoder: @unchecked Sendable {
     private var emittedCalls = 0
     private var failed = false
 
-    public init(tokenizer: GFTokenizer,
+    public init(tokenizer: any Tokenizing,
                 allowedTools: Set<String>,
                 idGenerator: @escaping @Sendable () -> String = {
                     "call_" + (0..<24).map { _ in String(format: "%x", UInt8.random(in: 0...15)) }.joined()

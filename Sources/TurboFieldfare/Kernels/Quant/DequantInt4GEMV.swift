@@ -16,6 +16,7 @@ final class DequantInt4GEMV {
         Shape(m: 8192, n: 2816),
         Shape(m: 1024, n: 2816),
         Shape(m: 2816, n: 8192),
+        Shape(m: 248320, n: 2048),
     ]
 
     private let pipeline: MTLComputePipelineState

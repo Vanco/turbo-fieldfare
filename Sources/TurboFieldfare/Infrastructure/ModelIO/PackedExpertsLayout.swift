@@ -55,7 +55,7 @@ struct PackedExpertsLayout: Sendable {
 }
 
 enum PackedExpertsLayoutReader {
-    static let defaultMaxBytes: UInt64 = 16 * 1024 * 1024
+    static let defaultMaxBytes: UInt64 = 64 * 1024 * 1024
 
     static func load(directoryURL: URL,
                             maxBytes: UInt64 = defaultMaxBytes) throws -> PackedExpertsLayout {

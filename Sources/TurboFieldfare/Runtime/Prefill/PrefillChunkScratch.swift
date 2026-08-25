@@ -3,7 +3,9 @@ import Metal
 struct PrefillChunkScratchLayout: Sendable, Equatable {
     let chunkTokens: Int
     let hiddenSize: Int
+    let gdnInternalPerToken: Int
     let maxQElementsPerToken: Int
+    let maxCompactQElementsPerToken: Int
     let maxKVElementsPerToken: Int
     let sharedIntermediate: Int
     let routedIntermediate: Int
@@ -11,11 +13,18 @@ struct PrefillChunkScratchLayout: Sendable, Equatable {
     let routedPairMicrobatchRows: Int
 
     init(config: ArchConfig,
-                chunkTokens: Int,
-                routedPairMicrobatchRows: Int = 32) {
+                 chunkTokens: Int,
+                 routedPairMicrobatchRows: Int = 32) {
         self.chunkTokens = max(1, min(chunkTokens, 256))
         self.hiddenSize = config.hiddenSize
-        self.maxQElementsPerToken = config.numHeads * max(config.headDim, config.fullHeadDim)
+        self.gdnInternalPerToken = config.linearNumValueHeads * config.linearHeadDim
+        // Output-gated full attention stores [head | gate] halves per q head,
+        // so the raw projection needs twice the compact width.
+        self.maxQElementsPerToken = config.numHeads
+            * max(config.headDim, config.fullHeadDim)
+            * (config.attentionOutputGate ? 2 : 1)
+        self.maxCompactQElementsPerToken = config.numHeads
+            * max(config.headDim, config.fullHeadDim)
         self.maxKVElementsPerToken = max(config.numKVHeads * config.headDim,
                                          config.numFullKVHeads * config.fullHeadDim)
         self.sharedIntermediate = config.intermediateSize
@@ -35,10 +44,17 @@ struct PrefillChunkScratchLayout: Sendable, Equatable {
     var kStageElements: Int { chunkTokens * maxKVElementsPerToken }
     var vStageElements: Int { kStageElements }
     var attentionOutputElements: Int { qElements }
+    var qCompactElements: Int { chunkTokens * maxCompactQElementsPerToken }
+    var gdnAuxElements: Int { chunkTokens * 64 }
     var denseXElements: Int { hiddenElements }
     var routedXElements: Int { hiddenElements }
     var routerXElements: Int { hiddenElements }
-    var h1Elements: Int { hiddenElements }
+    // GDN (linear-attention) layers emit `num_value_heads * value_head_dim`
+    // floats per token before the out_proj; size h1 for that (>= hidden).
+    var h1Elements: Int {
+        chunkTokens * max(hiddenSize, gdnInternalPerToken)
+    }
+    var gdnProjElements: Int { hiddenElements }
     var h2Elements: Int { hiddenElements }
     var routePartialElements: Int { chunkTokens * topK * hiddenSize }
     var routeIDElements: Int { chunkTokens * topK }
@@ -54,6 +70,8 @@ struct PrefillChunkScratchLayout: Sendable, Equatable {
             + kStageElements
             + vStageElements
             + attentionOutputElements
+            + qCompactElements
+            + gdnAuxElements
             + denseXElements
             + routedXElements
             + routerXElements
@@ -84,10 +102,13 @@ struct PrefillChunkScratchBuffers {
     let kStage: MTLBuffer
     let vStage: MTLBuffer
     let attentionOutput: MTLBuffer
+    let qCompact: MTLBuffer
+    let gdnAux: MTLBuffer
     let denseX: MTLBuffer
     let routedX: MTLBuffer
     let routerX: MTLBuffer
     let h1: MTLBuffer
+    let gdnProj: MTLBuffer
     let h2: MTLBuffer
     let routePartials: MTLBuffer
     let routeIDs: MTLBuffer
@@ -128,10 +149,13 @@ struct PrefillChunkScratchBuffers {
             kStage: try privateBuffer(layout.kStageElements, label: "prefill.kStage"),
             vStage: try privateBuffer(layout.vStageElements, label: "prefill.vStage"),
             attentionOutput: try privateBuffer(layout.attentionOutputElements, label: "prefill.attnOut"),
+            qCompact: try privateBuffer(layout.qCompactElements, label: "prefill.qCompact"),
+            gdnAux: try privateBuffer(layout.gdnAuxElements, label: "prefill.gdnAux"),
             denseX: try privateBuffer(layout.denseXElements, label: "prefill.denseX"),
             routedX: try privateBuffer(layout.routedXElements, label: "prefill.routedX"),
             routerX: try privateBuffer(layout.routerXElements, label: "prefill.routerX"),
             h1: try privateBuffer(layout.h1Elements, label: "prefill.h1"),
+            gdnProj: try privateBuffer(layout.gdnProjElements, label: "prefill.gdnProj"),
             h2: try privateBuffer(layout.h2Elements, label: "prefill.h2"),
             routePartials: try privateBuffer(layout.routePartialElements, label: "prefill.routePartials"),
             routeIDs: try sharedBuffer(layout.routeIDElements * MemoryLayout<UInt32>.stride,
