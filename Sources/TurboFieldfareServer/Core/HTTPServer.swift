@@ -58,7 +58,7 @@ public actor TurboFieldfareHTTPServer {
                 }
             }
             .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-        let channel = try await bootstrap.bind(host: "127.0.0.1", port: port).get()
+        let channel = try await bootstrap.bind(host: "0.0.0.0", port: port).get()
         self.channel = channel
         return channel
     }
