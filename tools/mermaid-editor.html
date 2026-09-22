@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mermaid 编辑器</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header {
+            background: #1a1a2e;
+            color: white;
+            padding: 12px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        h1 {
+            font-size: 18px;
+            font-weight: 500;
+        }
+        .container {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+        .pane {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+        .pane-header {
+            background: #16213e;
+            color: #e0e0e0;
+            padding: 8px 16px;
+            font-size: 13px;
+            font-weight: 500;
+            border-bottom: 1px solid #0f3460;
+        }
+        .editor-pane {
+            border-right: 1px solid #0f3460;
+        }
+        textarea {
+            flex: 1;
+            width: 100%;
+            border: none;
+            padding: 16px;
+            font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
+            font-size: 14px;
+            line-height: 1.6;
+            resize: none;
+            background: #0f0f23;
+            color: #e0e0e0;
+            outline: none;
+        }
+        textarea::placeholder {
+            color: #555;
+        }
+        .preview-pane {
+            background: #ffffff;
+        }
+        .preview-container {
+            flex: 1;
+            padding: 24px;
+            overflow: auto;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+        }
+        .preview-container svg {
+            max-width: 100%;
+            height: auto;
+        }
+        .error {
+            color: #e74c3c;
+            background: #fce4e4;
+            padding: 16px;
+            border-radius: 4px;
+            margin-top: 16px;
+            font-size: 14px;
+        }
+        .loading {
+            color: #666;
+            font-style: italic;
+        }
+        .btn {
+            background: #0f3460;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: background 0.2s;
+        }
+        .btn:hover {
+            background: #16213e;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Mermaid 编辑器</h1>
+        <button class="btn" onclick="clearEditor()">清空</button>
+    </header>
+    <div class="container">
+        <div class="pane editor-pane">
+            <div class="pane-header">编辑 Mermaid 代码</div>
+            <textarea id="editor" placeholder="在此输入 Mermaid 代码...
+
+例如：
+graph TD
+    A[开始] --> B{判断}
+    B -->|是| C[完成]
+    B -->|否| D[重试]
+    C --> E[结束]
+    D --> B" autofocus></textarea>
+        </div>
+        <div class="pane preview-pane">
+            <div  class="pane-header">
+            <button class="btn" onclick="render()">预览</button>
+            </div>
+            <div class="preview-container" id="preview"></div>
+        </div>
+    </div>
+    <script>
+        mermaid.initialize({ 
+            startOnLoad: false,
+            theme: 'default',
+            securityLevel: 'loose'
+        });
+
+        const editor = document.getElementById('editor');
+        const preview = document.getElementById('preview');
+
+        function render() {
+            const code = editor.value.trim();
+            if (!code) {
+                preview.innerHTML = '<div class="loading">等待输入...</div>';
+                return;
+            }
+
+            try {
+                mermaid.render('mermaid-svg', code, undefined).then((result) => {
+                    preview.innerHTML = result.svg;
+                });
+            } catch (error) {
+                preview.innerHTML = `<div class="error">渲染错误：${error.message}</div>`;
+            }
+        }
+
+        function clearEditor() {
+            editor.value = '';
+            preview.innerHTML = '<div class="loading">等待输入...</div>';
+        }
+
+    </script>
+</body>
+</html>
