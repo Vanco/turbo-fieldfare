@@ -10,13 +10,14 @@ public struct ServerArguments: Equatable, Sendable {
     public let promptCacheMode: ServerPromptCacheMode
     public let expertCacheSlots: Int
     public let expertCachePolicy: RuntimeExpertCachePolicy
+    public let expertStreamingMode: ExpertStreamingMode
     public let prefillPolicy: RuntimePrefillPolicy
     public let prefillChunkTokens: Int
     public let rdadvisePolicy: RDAdvicePolicyMode
     public let visionPack: String?
     public let visionResidency: VisionResidencyPolicy
 
-    public static let usage = """
+public static let usage = """
     usage: TurboFieldfareServer --model <completed .gturbo directory> [options]
 
       --model <dir>              Required model directory.
@@ -30,7 +31,8 @@ public struct ServerArguments: Equatable, Sendable {
       --prompt-cache-mode <off|single-prefix>
                                  Prompt KV reuse mode (default single-prefix).
       --expert-cache-slots <n>   Expert-cache slots: \(RuntimeConfiguration.allowedValueList(RuntimeConfiguration.allowedExpertCacheSlots)) (default 16).
-      --expert-cache-policy <s>  Expert-cache policy: lfu or lru (default lfu).
+      --expert-cache-policy      Expert-cache policy: lfu or lru (default lfu).
+      --expert-streaming-mode    Expert streaming: pread or mmap (default pread).
       --prefill on|off           Enable or disable chunked prompt prefill (default on).
                                  Chunked prefill requires 16 or more cache slots.
       --prefill-chunk-tokens <n|auto>
@@ -42,7 +44,7 @@ public struct ServerArguments: Equatable, Sendable {
                                  would. Prefill scratch is sized from the chunk,
                                  so the cap holds about 32.5 MB of it against
                                  16.4 MB at 128.
-      --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive
+      --rdadvise                 Read-advice policy: off, default, bounded, or adaptive
                                  (default off).
       --help                     Show this help.
     """
@@ -91,6 +93,7 @@ public struct ServerArguments: Equatable, Sendable {
         var visionResidency: VisionResidencyPolicy = .onDemand
         var expertCacheSlots = 16
         var expertCachePolicy = RuntimeExpertCachePolicy.lfu
+        var expertStreamingMode = ExpertStreamingMode.pread(slotCount: 16)
         var prefillPolicy = RuntimePrefillPolicy.chunked
         var prefillChunkTokens = 128
         var rdadvisePolicy = RDAdvicePolicyMode.off
@@ -154,6 +157,15 @@ public struct ServerArguments: Equatable, Sendable {
                     throw ServerArgumentError.invalid("--expert-cache-policy must be lfu or lru")
                 }
                 expertCachePolicy = parsed
+            case "--expert-streaming-mode":
+                switch value {
+                case "pread":
+                    expertStreamingMode = .pread(slotCount: expertCacheSlots)
+                case "mmap":
+                    expertStreamingMode = .mmap(slotCount: expertCacheSlots)
+                default:
+                    throw ServerArgumentError.invalid("--expert-streaming-mode must be pread or mmap")
+                }
             case "--prefill":
                 switch value {
                 case "on": prefillPolicy = .chunked
@@ -201,6 +213,7 @@ public struct ServerArguments: Equatable, Sendable {
                                promptCacheMode: promptCacheMode,
                                expertCacheSlots: expertCacheSlots,
                                expertCachePolicy: expertCachePolicy,
+                               expertStreamingMode: expertStreamingMode,
                                prefillPolicy: prefillPolicy,
                                prefillChunkTokens: prefillChunkTokens,
                                rdadvisePolicy: rdadvisePolicy,

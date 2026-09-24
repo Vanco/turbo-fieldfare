@@ -289,6 +289,7 @@ public actor MultimodalConversation {
     private let visionRuntimeError: Error?
     private let visionResidency: VisionResidencyPolicy
     private let maxContext: Int
+    private let speculativeSession: SpeculativeDecodeSession?
 
     /// Exactly the tokens the KV holds, in order.
     private var kvTokenIDs: [Int32] = []
@@ -321,7 +322,8 @@ public actor MultimodalConversation {
                 visionRuntime: VisionRuntime? = nil,
                 visionRuntimeError: Error? = nil,
                 visionResidency: VisionResidencyPolicy = .defaultPolicy,
-                maxContext: Int) {
+                maxContext: Int,
+                speculativeSession: SpeculativeDecodeSession? = nil) {
         self.model = model
         self.context = context
         self.tokenizer = tokenizer
@@ -331,6 +333,7 @@ public actor MultimodalConversation {
         self.visionRuntimeError = visionRuntimeError
         self.visionResidency = visionResidency
         self.maxContext = maxContext
+        self.speculativeSession = speculativeSession
     }
 
     public var kvTokenCount: Int { kvTokenIDs.count }
@@ -545,37 +548,58 @@ public actor MultimodalConversation {
         var kvAdvanced = false
         let result: RawDecodeResult
         do {
-            result = try await runRawCompletion(
-            producer: runner,
-            tokenizer: tokenizer,
-            promptIds: promptIDs,
-            multimodalInput: try turn.prefillInput?.prepending(boundary),
-            config: generation,
-            context: context,
-            scratch: scratch,
-            prefillConfig: effectivePrefill,
-            start: cached == 0 ? .reset : .resume(cachedPromptTokens: cached),
-                // Cancellation mid-decode ends the turn at a token boundary
-                // and returns the partial result; throwing here instead would
-                // condemn the lineage for a KV that is perfectly resumable.
-                shouldStop: {
-                    if shouldStop?() == true { return true }
-                    do { try checkCancellation(); return false } catch { return true }
-                }) { progress in
-                    onProgress?(progress)
-                    switch progress {
-                    case .token(_, _, let delta):
-                        text += delta
-                    case .tail(let tail):
-                        // The detokenizer flush at the stop boundary. Dropping
-                        // it returned turn text missing its final characters
-                        // while the KV kept those very tokens.
-                        text += tail
-                    case .prefill:
-                        // The first progress report is the proof the KV moved.
-                        kvAdvanced = true
+            if let speculativeSession {
+                result = try await runSpeculativeCompletion(
+                    runner: runner,
+                    speculativeSession: speculativeSession,
+                    tokenizer: tokenizer,
+                    promptIds: promptIDs,
+                    multimodalInput: try turn.prefillInput?.prepending(boundary),
+                    config: generation,
+                    context: context,
+                    scratch: scratch,
+                    prefillConfig: effectivePrefill,
+                    start: cached == 0 ? .reset : .resume(cachedPromptTokens: cached),
+                    shouldStop: {
+                        if shouldStop?() == true { return true }
+                        do { try checkCancellation(); return false } catch { return true }
+                    }) { progress in
+                        onProgress?(progress)
+                        switch progress {
+                        case .token(_, _, let delta):
+                            text += delta
+                        case .tail(let tail):
+                            text += tail
+                        case .prefill:
+                            kvAdvanced = true
+                        }
                     }
-                }
+            } else {
+                result = try await runRawCompletion(
+                    producer: runner,
+                    tokenizer: tokenizer,
+                    promptIds: promptIDs,
+                    multimodalInput: try turn.prefillInput?.prepending(boundary),
+                    config: generation,
+                    context: context,
+                    scratch: scratch,
+                    prefillConfig: effectivePrefill,
+                    start: cached == 0 ? .reset : .resume(cachedPromptTokens: cached),
+                    shouldStop: {
+                        if shouldStop?() == true { return true }
+                        do { try checkCancellation(); return false } catch { return true }
+                    }) { progress in
+                        onProgress?(progress)
+                        switch progress {
+                        case .token(_, _, let delta):
+                            text += delta
+                        case .tail(let tail):
+                            text += tail
+                        case .prefill:
+                            kvAdvanced = true
+                        }
+                    }
+            }
         } catch let generationError {
             if runner.continuationPosition != positionBefore { kvAdvanced = true }
             // A failure that moved the KV used to condemn the lineage outright,

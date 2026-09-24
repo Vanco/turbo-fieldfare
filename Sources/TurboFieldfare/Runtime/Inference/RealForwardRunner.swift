@@ -504,6 +504,20 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
                                outputMode: .greedyIfAvailable)
     }
 
+    /// Run one token at `position`, forcing the full LM head to write FP16
+    /// logits into `logits`.  Unlike `produce()`, this bypasses the fused
+    /// greedy head so the complete logit vector is always available — needed
+    /// by speculative-decoding verification which must inspect the full
+    /// distribution, not just the argmax.
+    public func produceWithLogits(token: Int32, position: Int, into logits: MTLBuffer) async throws {
+        try prefillChunkState.requireClean(operation: "produceWithLogits")
+        try await produceToken(token: token,
+                               position: position,
+                               into: logits,
+                               emitHead: true,
+                               outputMode: .logits)
+    }
+
     public func prefillChunked(tokens: ArraySlice<Int32>,
                                startPosition: Int,
                                outputMode: PrefillOutputMode,

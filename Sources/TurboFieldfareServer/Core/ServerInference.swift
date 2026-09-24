@@ -250,18 +250,20 @@ struct StructuredOutputFailure: Error, CustomDebugStringConvertible, Sendable {
 
 public struct ServerPreparedRequest: Sendable {
     public let request: ValidatedChatRequest
+    public let requestID: String
     fileprivate let promptIDs: [Int32]?
 
     public var promptTokenCount: Int? { promptIDs?.count }
 
-    init(request: ValidatedChatRequest, promptIDs: [Int32]? = nil) {
+    init(request: ValidatedChatRequest, requestID: String, promptIDs: [Int32]? = nil) {
         self.request = request
+        self.requestID = requestID
         self.promptIDs = promptIDs
     }
 }
 
 public protocol ServerInferenceBackend: Sendable {
-    func prepare(_ request: ValidatedChatRequest) async throws -> ServerPreparedRequest
+    func prepare(_ request: ValidatedChatRequest, requestID: String) async throws -> ServerPreparedRequest
     func generate(_ request: ValidatedChatRequest,
                   onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void) async throws -> ServerCompletion
     func generate(_ prepared: ServerPreparedRequest,
@@ -269,8 +271,8 @@ public protocol ServerInferenceBackend: Sendable {
 }
 
 public extension ServerInferenceBackend {
-    func prepare(_ request: ValidatedChatRequest) async throws -> ServerPreparedRequest {
-        ServerPreparedRequest(request: request)
+    func prepare(_ request: ValidatedChatRequest, requestID: String) async throws -> ServerPreparedRequest {
+        ServerPreparedRequest(request: request, requestID: requestID)
     }
 
     func generate(
@@ -542,7 +544,8 @@ public actor ServerModelSession: ServerInferenceBackend {
                             visionPackURL: URL? = nil,
                             visionResidencyPolicy: VisionResidencyPolicy = .onDemand,
                             promptCacheMode: ServerPromptCacheMode = .singlePrefix,
-                            runtimeConfiguration: RuntimeConfiguration) async throws -> ServerModelSession {
+                            runtimeConfiguration: RuntimeConfiguration,
+                            arguments: ServerArguments) async throws -> ServerModelSession {
         let tokenizerFolder = GFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
         guard let tokenizerFolder else {
             throw GFTokenizerError.missingToolTemplate
@@ -557,7 +560,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         let model = try Model.load(
             directoryURL: modelDirectory,
             device: context.device,
-            streamingMode: .pread(slotCount: runtime.expertCacheSlots),
+            streamingMode: arguments.expertStreamingMode,
             expertCachePolicy: runtime.modelExpertCachePolicy,
             integrityPolicy: .fullSha256)
         let runner = try RealForwardRunner(model: model,
@@ -681,17 +684,19 @@ public actor ServerModelSession: ServerInferenceBackend {
         _ request: ValidatedChatRequest,
         onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void
     ) async throws -> ServerCompletion {
-        let prepared = try await prepare(request)
+        let requestID = UUID().uuidString
+        let prepared = try await prepare(request, requestID: requestID)
         return try await generate(prepared, onEvent: onEvent)
     }
 
-    public func prepare(_ request: ValidatedChatRequest) async throws -> ServerPreparedRequest {
+    public func prepare(_ request: ValidatedChatRequest, requestID: String) async throws -> ServerPreparedRequest {
         if !request.imageFiles.isEmpty {
             let softTokens = try imageSoftTokenCounts(request)
             try validateImageTokenBudget(request, softTokens: softTokens)
         }
         return ServerPreparedRequest(
             request: request,
+            requestID: requestID,
             promptIDs: request.multimodalMessages == nil ? try renderPrompt(request) : nil)
     }
 
@@ -987,6 +992,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         var calls: [ParsedToolCall] = []
         var decodingError: Error?
         var shouldStop = false
+        var decodeStartedLogged = false
 
         completionStarted = true
         let result = try await runRawCompletion(
@@ -1001,6 +1007,10 @@ public actor ServerModelSession: ServerInferenceBackend {
             start: completionStart,
             shouldStop: { shouldStop }) { progress in
                 guard decodingError == nil else { return }
+                if !decodeStartedLogged {
+                    ServerLog.decodeStarted(id: prepared.requestID, promptTokens: effectivePromptIDs.count)
+                    decodeStartedLogged = true
+                }
                 do {
                     func handle(_ events: [StructuredAssistantEvent]) {
                         for event in events {
@@ -1077,7 +1087,7 @@ public actor ServerModelSession: ServerInferenceBackend {
                 kind: .decoderFinish,
                 cause: .classify(error))
         }
-        if needsToolTemplate, result.reason == .toolCalls, calls.isEmpty {
+        if needsToolTemplate, result.reason == StopReason.toolCalls, calls.isEmpty {
             throw structuredFailure(kind: .orphanToolResponse, cause: .none)
         }
         let tail = stopMatcher.finish()
@@ -1088,7 +1098,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         let reason: String
         if !calls.isEmpty {
             reason = "tool_calls"
-        } else if result.reason == .maxTokens {
+        } else if result.reason == StopReason.maxTokens {
             reason = "length"
         } else {
             reason = "stop"

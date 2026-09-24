@@ -68,7 +68,11 @@ public func run(args: Args,
         switch input {
         case .raw(let text):
             multimodalMessages = nil
-            promptIds = tokenizer.encode(text, addBOS: true)
+            // Instruction-tuned models expect chat template format. Wrap raw prompts
+            // in the chat template so the model sees the expected format.
+            let messages = [GFTokenizer.Message(role: .user, content: text)]
+            promptIds = tokenizer.encode(
+                try tokenizer.applyChatTemplate(messages), addBOS: false)
         case .messages(let messages):
             multimodalMessages = nil
             promptIds = tokenizer.encode(
@@ -178,7 +182,7 @@ public func run(args: Args,
         let model = try Model.load(
             directoryURL: modelURL,
             device: context.device,
-            streamingMode: .pread(slotCount: runtime.expertCacheSlots),
+            streamingMode: args.expertStreamingMode,
             expertCachePolicy: runtime.modelExpertCachePolicy,
             integrityPolicy: .fullSha256)
         let runner = try RealForwardRunner(
@@ -239,30 +243,79 @@ public func run(args: Args,
         let effectiveMaxNew = min(args.maxNew, args.maxContext - promptIds.count)
         let config = makeConfig(maxNewTokens: effectiveMaxNew)
 
-        let stats = try await runRawCompletion(
-            producer: runner,
-            tokenizer: tokenizer,
-            promptIds: promptIds,
-            multimodalInput: multimodalInput,
-            config: config,
-            context: context,
-            scratch: scratch,
-            prefillConfig: runtime.prefillConfig) { progress in
-                switch progress {
-                case .prefill:
-                    break
-                case .token(_, _, let delta):
-                    if !delta.isEmpty { stdout.write(Data(delta.utf8)) }
-                case .tail(let tail):
-                    stdout.write(Data(tail.utf8))
-                }
+        // Speculative decoding setup.
+        let speculativeSession: SpeculativeDecodeSession?
+        if let draftModelPath = args.draftModel {
+            let draftModelURL = URL(fileURLWithPath: draftModelPath)
+            let draftConfig = DraftModelConfig(
+                modelURL: draftModelURL,
+                draftDepth: args.speculativeK,
+                acceptanceStrategy: args.acceptanceStrategy,
+                enableAdaptiveK: args.adaptiveK)
+            speculativeSession = try SpeculativeDecodeSession.make(
+                config: draftConfig,
+                context: context,
+                maxContextLength: args.maxContext,
+                vocab: model.config.vocabSize)
+            if !args.quiet {
+                let msg = "[speculative decoding enabled: k=\(args.speculativeK) strategy=\(draftConfig.acceptanceStrategy)]\n"
+                stderr.write(Data(msg.utf8))
             }
+        } else {
+            speculativeSession = nil
+        }
+
+        let stats: RawDecodeResult
+        if let speculativeSession {
+            stats = try await runSpeculativeCompletion(
+                runner: runner,
+                speculativeSession: speculativeSession,
+                tokenizer: tokenizer,
+                promptIds: promptIds,
+                multimodalInput: multimodalInput,
+                config: config,
+                context: context,
+                scratch: scratch,
+                prefillConfig: runtime.prefillConfig) { progress in
+                    switch progress {
+                    case .prefill:
+                        break
+                    case .token(_, _, let delta):
+                        if !delta.isEmpty { stdout.write(Data(delta.utf8)) }
+                    case .tail(let tail):
+                        stdout.write(Data(tail.utf8))
+                    }
+                }
+        } else {
+            stats = try await runRawCompletion(
+                producer: runner,
+                tokenizer: tokenizer,
+                promptIds: promptIds,
+                multimodalInput: multimodalInput,
+                config: config,
+                context: context,
+                scratch: scratch,
+                prefillConfig: runtime.prefillConfig) { progress in
+                    switch progress {
+                    case .prefill:
+                        break
+                    case .token(_, _, let delta):
+                        if !delta.isEmpty { stdout.write(Data(delta.utf8)) }
+                    case .tail(let tail):
+                        stdout.write(Data(tail.utf8))
+                    }
+                }
+        }
 
         if !args.quiet {
             let tokensPerSecond = stats.decodeSeconds > 0
                 ? Double(stats.newTokens) / stats.decodeSeconds
                 : 0
-            let footer = "\n[stop=\(String(describing: stats.reason)) prefill=\(stats.prefillTokens)tok new=\(stats.newTokens)tok decode=\(String(format: "%.2f", stats.decodeSeconds))s tok/s=\(String(format: "%.3f", tokensPerSecond))]\n"
+            var footer = "\n[stop=\(String(describing: stats.reason)) prefill=\(stats.prefillTokens)tok new=\(stats.newTokens)tok decode=\(String(format: "%.2f", stats.decodeSeconds))s tok/s=\(String(format: "%.3f", tokensPerSecond))]"
+            if let ss = speculativeSession {
+                footer += " [speculative: \(ss.totalRounds) rounds accepted=\(ss.totalAccepted)/\(ss.totalDrafted) rate=\(String(format: "%.1f", ss.acceptanceRate * 100))% draft=\(String(format: "%.3f", ss.draftModelSeconds))s main=\(String(format: "%.3f", ss.mainModelSeconds))s]"
+            }
+            footer += "\n"
             stderr.write(Data(footer.utf8))
         }
         return RunResult(exitCode: 0)

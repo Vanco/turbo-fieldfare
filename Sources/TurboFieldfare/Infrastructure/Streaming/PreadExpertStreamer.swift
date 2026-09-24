@@ -54,7 +54,7 @@ public enum ExpertCachePolicy: String, Sendable {
 }
 
 /// `pread`-based routed-expert streamer with a fixed per-layer slot cache.
-public final class PreadExpertStreamer: @unchecked Sendable {
+public final class PreadExpertStreamer: @unchecked Sendable, ExpertStreamer {
     public static let scratchAlignment = 2 * 1024 * 1024
     public static var cachePolicyDefault: ExpertCachePolicy { .lfu }
 
@@ -419,5 +419,290 @@ public final class PreadExpertStreamer: @unchecked Sendable {
     /// ownership or lifetime API.
     public var diagnosticSlotScratchBytes: UInt64 {
         UInt64(slotCount) * UInt64(slotAllocationSize)
+    }
+}
+
+/// Memory-mapped expert streamer using OS page cache for read-ahead and caching.
+public final class MmapExpertStreamer: @unchecked Sendable, ExpertStreamer {
+    public static let scratchAlignment = 2 * 1024 * 1024
+
+    public let layout: StreamLayout
+    public let slotCount: Int
+    public let cachePolicy: ExpertCachePolicy
+    private let slotAllocationSize: Int
+
+    private let mmapPtr: UnsafeMutableRawPointer
+    private let mmapSize: UInt64
+    private let slotPointers: [UnsafeMutableRawPointer]
+    private let slotBuffers: [MTLBuffer]
+
+    private var nextSlot = 0
+    private let cursorLock = NSLock()
+
+    private var slotExpert: [Int]
+    private var slotLastUse: [Int]
+    private var expertUseCount: [Int]
+    private var useClock = 0
+    private let cacheLock = NSLock()
+
+    public init(layout: StreamLayout,
+                device: MTLDevice,
+                slotCount: Int,
+                cachePolicy: ExpertCachePolicy = .lfu) throws {
+        precondition(slotCount > 0, "slotCount must be positive")
+        self.layout = layout
+        self.slotCount = slotCount
+        self.cachePolicy = cachePolicy
+
+        let pageSize = Int(getpagesize())
+        let allocationSize = ((Int(layout.expertStride) + pageSize - 1) / pageSize) * pageSize
+        self.slotAllocationSize = allocationSize
+
+        // Open file and mmap
+        let fd = open(layout.path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else {
+            throw StreamerError.openFailed(path: layout.path, errno: errno)
+        }
+        defer { close(fd) }
+
+        var fileStats = stat()
+        guard fstat(fd, &fileStats) == 0,
+              (fileStats.st_mode & S_IFMT) == S_IFREG,
+              fileStats.st_size >= 0 else {
+            throw StreamerError.openFailed(path: layout.path, errno: errno == 0 ? EINVAL : errno)
+        }
+        let required = layout.streamOffset + layout.streamSize
+        guard UInt64(fileStats.st_size) >= required else {
+            throw StreamerError.sizeMismatch(expected: required, actual: UInt64(fileStats.st_size))
+        }
+
+        // mmap the expert region
+        let mmapOffset = layout.streamOffset
+        let mmapSize = layout.streamSize
+        let ptr = mmap(nil, Int(mmapSize), PROT_READ, MAP_PRIVATE, fd, off_t(mmapOffset))
+        guard ptr != MAP_FAILED else {
+            throw StreamerError.openFailed(path: layout.path, errno: errno)
+        }
+        self.mmapPtr = ptr!
+        self.mmapSize = mmapSize
+
+        // Advise sequential access for read-ahead
+        madvise(ptr!, Int(mmapSize), MADV_SEQUENTIAL | MADV_WILLNEED)
+
+        // Allocate slot buffers
+        var pointers: [UnsafeMutableRawPointer] = []
+        var buffers: [MTLBuffer] = []
+        pointers.reserveCapacity(slotCount)
+        buffers.reserveCapacity(slotCount)
+
+        func unwind() {
+            for index in buffers.count..<pointers.count {
+                free(pointers[index])
+            }
+        }
+
+        for _ in 0..<slotCount {
+            var raw: UnsafeMutableRawPointer?
+            let result = posix_memalign(&raw, Self.scratchAlignment, allocationSize)
+            guard result == 0, let pointer = raw else {
+                unwind()
+                throw StreamerError.allocFailed(errno: result)
+            }
+            pointers.append(pointer)
+            nonisolated(unsafe) let capturedPointer = pointer
+            guard let buffer = device.makeBuffer(
+                bytesNoCopy: pointer,
+                length: allocationSize,
+                options: .storageModeShared,
+                deallocator: { _, _ in free(capturedPointer) })
+            else {
+                unwind()
+                throw StreamerError.bufferWrapFailed
+            }
+            buffers.append(buffer)
+        }
+
+        self.slotPointers = pointers
+        self.slotBuffers = buffers
+        self.slotExpert = [Int](repeating: -1, count: slotCount)
+        self.slotLastUse = [Int](repeating: 0, count: slotCount)
+        self.expertUseCount = [Int](repeating: 0, count: max(1, layout.expertsPerLayer))
+    }
+
+    deinit {
+        munmap(mmapPtr, Int(mmapSize))
+    }
+
+    public func loadExpert(layer: Int, expert: Int) throws
+        -> (buffer: MTLBuffer, offset: UInt64, size: UInt64) {
+        cursorLock.lock()
+        let slot = nextSlot
+        nextSlot = (nextSlot + 1) % slotCount
+        cursorLock.unlock()
+        return try loadExpert(layer: layer, expert: expert, slot: slot)
+    }
+
+    public func loadExpert(layer: Int, expert: Int, slot: Int) throws
+        -> (buffer: MTLBuffer, offset: UInt64, size: UInt64) {
+        guard slot >= 0 && slot < slotCount else {
+            throw StreamerError.slotOutOfRange(slot)
+        }
+        let regionOffset = layout.expertOffset(layer: layer, expert: expert)
+        guard regionOffset + layout.expertStride <= layout.streamSize else {
+            throw StreamerError.offsetOutOfRange(regionOffset)
+        }
+
+        // Copy from mmap'd region (page cache) to slot buffer
+        let src = mmapPtr.advanced(by: Int(regionOffset))
+        let dst = slotPointers[slot]
+        memcpy(dst, src, Int(layout.expertStride))
+
+        return (slotBuffers[slot], 0, layout.expertStride)
+    }
+
+    // ... copy cache plan methods from PreadExpertStreamer ...
+    public func loadExpertsCached(experts: [Int]) throws
+        -> [(buffer: MTLBuffer, offset: UInt64, size: UInt64)] {
+        try executeExpertCachePlan(planExpertsCached(experts: experts))
+    }
+
+    public func planExpertsCached(experts: [Int],
+                                  avoidingSlots: Set<Int> = []) -> ExpertCachePlan {
+        guard let plan = makeExpertCachePlan(experts: experts, avoidingSlots: avoidingSlots) else {
+            preconditionFailure("expert cache cannot place requested misses")
+        }
+        return plan
+    }
+
+    public func planExpertsCachedIfPossible(experts: [Int],
+                                            avoidingSlots: Set<Int> = []) -> ExpertCachePlan? {
+        makeExpertCachePlan(experts: experts, avoidingSlots: avoidingSlots)
+    }
+
+    private func makeExpertCachePlan(experts: [Int],
+                                     avoidingSlots rawAvoidingSlots: Set<Int>) -> ExpertCachePlan? {
+        precondition(experts.count <= slotCount,
+                     "expert cache needs at least \(experts.count) slots")
+        let avoidingSlots = Set(rawAvoidingSlots.filter { $0 >= 0 && $0 < slotCount })
+
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+
+        let clock = useClock + 1
+        var assignedSlots = [Int](repeating: -1, count: experts.count)
+        var reserved = [Bool](repeating: false, count: slotCount)
+
+        for index in experts.indices {
+            for slot in 0..<slotCount
+                where !reserved[slot] && slotExpert[slot] == experts[index] {
+                assignedSlots[index] = slot
+                reserved[slot] = true
+                break
+            }
+        }
+        for slot in avoidingSlots where !reserved[slot] {
+            reserved[slot] = true
+        }
+
+        let misses = experts.indices.filter { assignedSlots[$0] == -1 }
+        let evictable = (0..<slotCount)
+            .filter { !reserved[$0] }
+            .sorted { shouldEvictSlot($0, before: $1) }
+        guard misses.count <= evictable.count else { return nil }
+
+        useClock = clock
+        for expert in experts where expert >= 0 && expert < expertUseCount.count {
+            expertUseCount[expert] &+= 1
+        }
+        for slot in assignedSlots where slot >= 0 {
+            slotLastUse[slot] = clock
+        }
+        for (offset, index) in misses.enumerated() {
+            let slot = evictable[offset]
+            assignedSlots[index] = slot
+            reserved[slot] = true
+            slotExpert[slot] = -1
+            slotLastUse[slot] = clock
+        }
+
+        return ExpertCachePlan(
+            experts: experts,
+            assignedSlots: assignedSlots,
+            misses: misses,
+            hits: experts.count - misses.count)
+    }
+
+    public func executeExpertCachePlan(_ plan: ExpertCachePlan) throws
+        -> [(buffer: MTLBuffer, offset: UInt64, size: UInt64)] {
+        precondition(plan.experts.count <= slotCount,
+                     "expert cache plan exceeds slot count")
+        precondition(plan.assignedSlots.count == plan.experts.count,
+                     "expert cache plan slot count mismatch")
+
+        let errorLock = NSLock()
+        nonisolated(unsafe) var firstError: Error?
+        DispatchQueue.concurrentPerform(iterations: plan.misses.count) { missOffset in
+            let index = plan.misses[missOffset]
+            do {
+                _ = try self.loadExpert(
+                    layer: 0,
+                    expert: plan.experts[index],
+                    slot: plan.assignedSlots[index])
+            } catch {
+                errorLock.lock()
+                if firstError == nil { firstError = error }
+                errorLock.unlock()
+            }
+        }
+        if let firstError { throw firstError }
+
+        cacheLock.lock()
+        for index in plan.misses {
+            slotExpert[plan.assignedSlots[index]] = plan.experts[index]
+        }
+        cacheLock.unlock()
+
+        var results: [(buffer: MTLBuffer, offset: UInt64, size: UInt64)] = []
+        results.reserveCapacity(plan.experts.count)
+        for (expert, slot) in zip(plan.experts, plan.assignedSlots) {
+            results.append((slotBuffers[slot], 0, layout.expertStride))
+        }
+        return results
+    }
+
+    private func shouldEvictSlot(_ lhs: Int, before rhs: Int) -> Bool {
+        let lhsExpert = slotExpert[lhs]
+        let rhsExpert = slotExpert[rhs]
+        let lhsCount = (lhsExpert >= 0 && lhsExpert < expertUseCount.count) ? expertUseCount[lhsExpert] : 0
+        let rhsCount = (rhsExpert >= 0 && rhsExpert < expertUseCount.count) ? expertUseCount[rhsExpert] : 0
+        if cachePolicy == .lfu {
+            if lhsCount != rhsCount { return lhsCount < rhsCount }
+        }
+        return slotLastUse[lhs] < slotLastUse[rhs]
+    }
+
+    /// Model-derived CPU-side scratch owned by this streamer.
+    public var diagnosticSlotScratchBytes: UInt64 {
+        UInt64(slotCount) * UInt64(slotAllocationSize)
+    }
+
+    public func expertCachePlanBuffers(_ plan: ExpertCachePlan)
+        -> [(buffer: MTLBuffer, offset: UInt64, size: UInt64)] {
+        precondition(plan.assignedSlots.count == plan.experts.count,
+                     "expert cache plan slot count mismatch")
+        return plan.assignedSlots.map { slot in
+            (slotBuffers[slot], UInt64(0), layout.expertStride)
+        }
+    }
+
+    public func adviseExpertCachePlanMisses(_ plan: ExpertCachePlan) -> ExpertIOAdviceResult {
+        // With mmap, OS page cache handles read-ahead; no explicit advice needed.
+        let experts = plan.misses.map { plan.experts[$0] }
+        return ExpertIOAdviceResult.skipped(requested: experts.count)
+    }
+
+    public func adviseExpertMisses(experts: [Int]) -> ExpertIOAdviceResult {
+        // With mmap, OS page cache handles read-ahead; no explicit advice needed.
+        return ExpertIOAdviceResult.skipped(requested: experts.count)
     }
 }

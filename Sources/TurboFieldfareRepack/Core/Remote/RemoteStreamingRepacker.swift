@@ -30,7 +30,8 @@ public struct RemoteStreamingRepackOptions: Sendable {
                 resume: Bool = false,
                 dryRunSpaceCheck: Bool = false,
                 downloadSession: RemoteDownloadSession = RemoteDownloadSession(),
-                baseURL: URL = URL(string: "https://huggingface.co")!,
+                baseURL: URL = ProcessInfo.processInfo.environment["HF_ENDPOINT"]
+        .flatMap { URL(string: $0) } ?? URL(string: "https://huggingface.co")!,
                 rangeRetryAttempts: Int = 4,
                 retryBaseDelayNs: UInt64 = 1_000_000_000) {
         self.repoID = repoID

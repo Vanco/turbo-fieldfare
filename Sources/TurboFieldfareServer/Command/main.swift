@@ -36,7 +36,8 @@ do {
         },
         visionResidencyPolicy: arguments.visionResidency,
         promptCacheMode: arguments.promptCacheMode,
-        runtimeConfiguration: runtimeConfiguration)
+        runtimeConfiguration: runtimeConfiguration,
+        arguments: arguments)
     let server = TurboFieldfareHTTPServer(
         modelID: arguments.modelID,
         queueLimit: arguments.queueLimit,

@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 
 enum StreamerError: Error, CustomStringConvertible {
     case openFailed(path: String, errno: Int32)
@@ -63,4 +64,22 @@ public struct StreamLayout: Sendable {
         let perLayer = UInt64(expertsPerLayer) * expertStride
         return UInt64(layer) * perLayer + UInt64(expert) * expertStride
     }
+}
+
+/// Common interface for expert streamers.
+public protocol ExpertStreamer: Sendable {
+    var layout: StreamLayout { get }
+    var slotCount: Int { get }
+    var cachePolicy: ExpertCachePolicy { get }
+    var diagnosticSlotScratchBytes: UInt64 { get }
+
+    func loadExpert(layer: Int, expert: Int) throws -> (buffer: MTLBuffer, offset: UInt64, size: UInt64)
+    func loadExpert(layer: Int, expert: Int, slot: Int) throws -> (buffer: MTLBuffer, offset: UInt64, size: UInt64)
+    func loadExpertsCached(experts: [Int]) throws -> [(buffer: MTLBuffer, offset: UInt64, size: UInt64)]
+    func planExpertsCached(experts: [Int], avoidingSlots: Set<Int>) -> ExpertCachePlan
+    func planExpertsCachedIfPossible(experts: [Int], avoidingSlots: Set<Int>) -> ExpertCachePlan?
+    func executeExpertCachePlan(_ plan: ExpertCachePlan) throws -> [(buffer: MTLBuffer, offset: UInt64, size: UInt64)]
+    func expertCachePlanBuffers(_ plan: ExpertCachePlan) -> [(buffer: MTLBuffer, offset: UInt64, size: UInt64)]
+    func adviseExpertCachePlanMisses(_ plan: ExpertCachePlan) -> ExpertIOAdviceResult
+    func adviseExpertMisses(experts: [Int]) -> ExpertIOAdviceResult
 }

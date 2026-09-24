@@ -18,9 +18,11 @@ public struct ModelLoadStats: Sendable {
 }
 
 /// Bounded routed-expert cache configuration.
-public enum ExpertStreamingMode: Sendable {
-    /// Read each expert into one of `slotCount` 2 MB-aligned cache slots.
+public enum ExpertStreamingMode: Sendable, Equatable {
+    /// Read each expert into one of `slotCount` 2 MB-aligned cache slots via `pread`.
     case pread(slotCount: Int)
+    /// Memory-map the expert file; load via page cache (OS handles read-ahead/caching).
+    case mmap(slotCount: Int)
 }
 
 /// Loaded `.gturbo/` model. Resident weights live behind one mmap'd
@@ -49,7 +51,7 @@ public struct Model {
     let streamersQueue: DispatchQueue
 
     final class StreamersBox: @unchecked Sendable {
-        var streamers: [PreadExpertStreamer?]
+        var streamers: [(any ExpertStreamer)?]
         var layerVerified: [Bool]
         init(numLayers: Int) {
             self.streamers = Array(repeating: nil, count: numLayers)
@@ -307,16 +309,25 @@ public struct Model {
             expertStride: packedExpertsLayout.expertStride,
             expertOffsets: packedExpertsLayout.layers[L].experts.map(\.offset))
         let slotCount: Int
+        let streamer: any ExpertStreamer
         switch streamingMode {
         case .pread(let configuredSlotCount):
             slotCount = configuredSlotCount
+            streamer = try PreadExpertStreamer(
+                layout: layout,
+                device: device,
+                slotCount: slotCount,
+                cachePolicy: expertCachePolicy,
+                fileDescriptor: layerFD)
+        case .mmap(let configuredSlotCount):
+            slotCount = configuredSlotCount
+            streamer = try MmapExpertStreamer(
+                layout: layout,
+                device: device,
+                slotCount: slotCount,
+                cachePolicy: expertCachePolicy)
         }
-        streamersBox.streamers[L] = try PreadExpertStreamer(
-            layout: layout,
-            device: device,
-            slotCount: slotCount,
-            cachePolicy: expertCachePolicy,
-            fileDescriptor: layerFD)
+        streamersBox.streamers[L] = streamer
         streamersBox.layerVerified[L] = true
     }
 

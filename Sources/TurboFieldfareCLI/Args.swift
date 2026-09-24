@@ -19,12 +19,19 @@ public struct Args: Equatable, Sendable {
     public var quiet: Bool
     public var expertCacheSlots: Int
     public var expertCachePolicy: RuntimeExpertCachePolicy
+    public var expertStreamingMode: ExpertStreamingMode
     public var prefillPolicy: RuntimePrefillPolicy
     public var prefillChunkTokens: Int
     /// `--prefill-chunk-tokens auto`: the size is decided once the prompt length
     /// is known, which needs the tokenizer and, for images, their geometry.
     public var prefillChunkTokensAuto: Bool
     public var rdadvisePolicy: RDAdvicePolicyMode
+
+    // Speculative decoding
+    public var draftModel: String?
+    public var speculativeK: Int
+    public var acceptanceStrategy: AcceptanceStrategy
+    public var adaptiveK: Bool
 
     public init(model: String,
                 prompt: String? = nil,
@@ -44,10 +51,15 @@ public struct Args: Equatable, Sendable {
                 quiet: Bool = false,
                 expertCacheSlots: Int = RuntimeConfiguration.production.expertCacheSlots,
                 expertCachePolicy: RuntimeExpertCachePolicy = RuntimeConfiguration.production.expertCachePolicy,
+                expertStreamingMode: ExpertStreamingMode = .pread(slotCount: RuntimeConfiguration.production.expertCacheSlots),
                 prefillPolicy: RuntimePrefillPolicy = RuntimeConfiguration.production.prefillPolicy,
                 prefillChunkTokens: Int = RuntimeConfiguration.production.prefillChunkTokens,
-                prefillChunkTokensAuto: Bool = false,
-                rdadvisePolicy: RDAdvicePolicyMode = RuntimeConfiguration.production.rdadvisePolicy) {
+                 prefillChunkTokensAuto: Bool = false,
+                 rdadvisePolicy: RDAdvicePolicyMode = RuntimeConfiguration.production.rdadvisePolicy,
+                 draftModel: String? = nil,
+                 speculativeK: Int = 5,
+                 acceptanceStrategy: AcceptanceStrategy = .tokenMatch,
+                 adaptiveK: Bool = true) {
         self.model = model
         self.prompt = prompt
         self.chatPrompt = chatPrompt
@@ -66,10 +78,15 @@ public struct Args: Equatable, Sendable {
         self.quiet = quiet
         self.expertCacheSlots = expertCacheSlots
         self.expertCachePolicy = expertCachePolicy
+        self.expertStreamingMode = expertStreamingMode
         self.prefillPolicy = prefillPolicy
         self.prefillChunkTokens = prefillChunkTokens
         self.prefillChunkTokensAuto = prefillChunkTokensAuto
         self.rdadvisePolicy = rdadvisePolicy
+        self.draftModel = draftModel
+        self.speculativeK = speculativeK
+        self.acceptanceStrategy = acceptanceStrategy
+        self.adaptiveK = adaptiveK
     }
 }
 
@@ -140,7 +157,8 @@ extension Args {
       --stop <string>            Stop substring (repeatable).
       --quiet                    Suppress the timing footer.
       --expert-cache-slots <n>   Expert-cache slots: \(RuntimeConfiguration.allowedValueList(RuntimeConfiguration.allowedExpertCacheSlots)) (default 16).
-      --expert-cache-policy <s>  Expert-cache policy: lfu or lru (default lfu).
+      --expert-cache-policy   Expert-cache policy: lfu or lru (default lfu).
+      --expert-streaming-mode   Expert streaming: pread or mmap (default pread).
       --prefill on|off           Enable or disable chunked prompt prefill (default on).
                                  Chunked prefill requires 16 or more cache slots.
       --prefill-chunk-tokens <n|auto>
@@ -149,6 +167,12 @@ extension Args {
                                  expert pool, so larger chunks read less; auto
                                  picks the smallest size that covers the prompt.
       --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive (default off).
+
+    speculative decoding:
+      --draft-model <dir>        Path to a CoreML draft model (.mlpackage) for speculative decoding.
+      --speculative-k <int>      Draft depth per round (default 5; range 1-10).
+      --acceptance-strategy <s>  Acceptance strategy: token-match, top-k, or probability-threshold (default token-match).
+      --no-adaptive-k            Disable adaptive K (fixed draft depth per round).
       --help                     Show this message.
     """
 
@@ -210,10 +234,15 @@ extension Args {
         let runtimeDefaults = RuntimeConfiguration.production
         var expertCacheSlots = runtimeDefaults.expertCacheSlots
         var expertCachePolicy = runtimeDefaults.expertCachePolicy
+        var expertStreamingMode = ExpertStreamingMode.pread(slotCount: runtimeDefaults.expertCacheSlots)
         var prefillPolicy = runtimeDefaults.prefillPolicy
         var prefillChunkTokens = runtimeDefaults.prefillChunkTokens
         var prefillChunkTokensAuto = false
         var rdadvisePolicy = runtimeDefaults.rdadvisePolicy
+        var draftModel: String?
+        var speculativeK = 5
+        var acceptanceStrategy: AcceptanceStrategy = .tokenMatch
+        var adaptiveK = true
 
         var index = 0
         while index < argv.count {
@@ -299,6 +328,16 @@ extension Args {
                     throw ArgsError.invalidValue(flag: flag, value: value)
                 }
                 expertCachePolicy = parsed
+            case "--expert-streaming-mode":
+                let value = try takeValue(argv, &index, flag: flag)
+                switch value {
+                case "pread":
+                    expertStreamingMode = .pread(slotCount: expertCacheSlots)
+                case "mmap":
+                    expertStreamingMode = .mmap(slotCount: expertCacheSlots)
+                default:
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
             case "--prefill":
                 let value = try takeValue(argv, &index, flag: flag)
                 switch value {
@@ -327,6 +366,25 @@ extension Args {
                     throw ArgsError.invalidValue(flag: flag, value: value)
                 }
                 rdadvisePolicy = parsed
+            case "--draft-model":
+                draftModel = try takeValue(argv, &index, flag: flag)
+            case "--speculative-k":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard let parsed = Int(value), (1...10).contains(parsed) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                speculativeK = parsed
+            case "--acceptance-strategy":
+                let value = try takeValue(argv, &index, flag: flag)
+                switch value {
+                case "token-match": acceptanceStrategy = .tokenMatch
+                case "top-k": acceptanceStrategy = .topK(k: 10)
+                case "probability-threshold": acceptanceStrategy = .probabilityThreshold(threshold: 0.1)
+                default: throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+            case "--no-adaptive-k":
+                adaptiveK = false
+                index += 1
             default:
                 throw ArgsError.unknownFlag(flag)
             }
@@ -381,13 +439,18 @@ extension Args {
                              repetitionPenalty: repetitionPenalty,
                              seed: seed,
                              stops: stops,
-                             quiet: quiet,
-                             expertCacheSlots: expertCacheSlots,
-                             expertCachePolicy: expertCachePolicy,
-                             prefillPolicy: prefillPolicy,
-                             prefillChunkTokens: prefillChunkTokens,
+quiet: quiet,
+                              expertCacheSlots: expertCacheSlots,
+                              expertCachePolicy: expertCachePolicy,
+                              expertStreamingMode: expertStreamingMode,
+                              prefillPolicy: prefillPolicy,
+                              prefillChunkTokens: prefillChunkTokens,
                              prefillChunkTokensAuto: prefillChunkTokensAuto,
-                             rdadvisePolicy: rdadvisePolicy)
+                             rdadvisePolicy: rdadvisePolicy,
+                             draftModel: draftModel,
+                             speculativeK: speculativeK,
+                             acceptanceStrategy: acceptanceStrategy,
+                             adaptiveK: adaptiveK)
         _ = try arguments.resolvedRuntimeConfiguration(forceLogitsHead: false)
         return arguments
     }
