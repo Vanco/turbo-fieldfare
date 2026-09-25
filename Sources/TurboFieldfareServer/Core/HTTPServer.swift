@@ -377,20 +377,14 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                 }
                 let started = ContinuousClock.now
                 ServerLog.accepted(id: responseID, streaming: request.stream)
-                let prefillStarted = ContinuousClock.now
-                ServerLog.prefillStarted(id: responseID)
                 do {
                     let completion = try await self.coordinator.runPreparing(
                         onQueued: onQueued,
                         prepare: {
                             let prepared = try await self.backend.prepare(request, requestID: responseID)
                             phaseState.set("prepared")
-                            let prefillDuration = prefillStarted.duration(to: .now)
-                            ServerLog.prefillEnded(id: responseID,
-                                                   promptTokens: prepared.promptTokenCount,
-                                                   duration: prefillDuration)
                             ServerLog.prepared(id: responseID,
-                                               promptTokens: prepared.promptTokenCount)
+                                              promptTokens: prepared.promptTokenCount)
                             return prepared
                         },
                         operation: { prepared in
@@ -403,6 +397,8 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                             return try await self.backend.generate(prepared) { event in
                                 guard request.stream else { return }
                                 switch event {
+                                case .prefill(let done, let total):
+                                    ServerLog.prefill(id: responseID, actual: done, total: total)
                                 case .content(let text):
                                     self.writeStreamChunk(
                                         contextBox.value,

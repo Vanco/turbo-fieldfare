@@ -5,17 +5,8 @@ enum ServerLog {
         write("request \(id) accepted streaming=\(streaming)")
     }
 
-    static func prefillStarted(id: String) {
-        write("request \(id) prefill_started")
-    }
-
-    static func prefillEnded(id: String, promptTokens: Int?, duration: Duration) {
-        let count = promptTokens.map(String.init) ?? "backend-managed"
-        write("request \(id) prefill_ended prompt=\(count) duration=\(format(duration))")
-    }
-
-    static func decodeStarted(id: String, promptTokens: Int) {
-        write("request \(id) decode_started prompt=\(promptTokens)")
+    static func prefill(id: String, actual: Int, total: Int) {
+        write("request \(id) prefill \(actual)/\(total)")
     }
 
     static func prepared(id: String, promptTokens: Int?) {

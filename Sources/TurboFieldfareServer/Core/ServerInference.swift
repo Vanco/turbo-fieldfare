@@ -3,6 +3,7 @@ import Foundation
 import TurboFieldfare
 
 public enum ServerInferenceEvent: Equatable, Sendable {
+    case prefill(Int, Int)
     case content(String)
     case toolCall(ParsedToolCall)
 }
@@ -250,20 +251,18 @@ struct StructuredOutputFailure: Error, CustomDebugStringConvertible, Sendable {
 
 public struct ServerPreparedRequest: Sendable {
     public let request: ValidatedChatRequest
-    public let requestID: String
     fileprivate let promptIDs: [Int32]?
 
     public var promptTokenCount: Int? { promptIDs?.count }
 
-    init(request: ValidatedChatRequest, requestID: String, promptIDs: [Int32]? = nil) {
+    init(request: ValidatedChatRequest, promptIDs: [Int32]? = nil) {
         self.request = request
-        self.requestID = requestID
         self.promptIDs = promptIDs
     }
 }
 
 public protocol ServerInferenceBackend: Sendable {
-    func prepare(_ request: ValidatedChatRequest, requestID: String) async throws -> ServerPreparedRequest
+    func prepare(_ request: ValidatedChatRequest) async throws -> ServerPreparedRequest
     func generate(_ request: ValidatedChatRequest,
                   onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void) async throws -> ServerCompletion
     func generate(_ prepared: ServerPreparedRequest,
@@ -272,7 +271,7 @@ public protocol ServerInferenceBackend: Sendable {
 
 public extension ServerInferenceBackend {
     func prepare(_ request: ValidatedChatRequest, requestID: String) async throws -> ServerPreparedRequest {
-        ServerPreparedRequest(request: request, requestID: requestID)
+        ServerPreparedRequest(request: request)
     }
 
     func generate(
@@ -689,14 +688,13 @@ public actor ServerModelSession: ServerInferenceBackend {
         return try await generate(prepared, onEvent: onEvent)
     }
 
-    public func prepare(_ request: ValidatedChatRequest, requestID: String) async throws -> ServerPreparedRequest {
+    public func prepare(_ request: ValidatedChatRequest) async throws -> ServerPreparedRequest {
         if !request.imageFiles.isEmpty {
             let softTokens = try imageSoftTokenCounts(request)
             try validateImageTokenBudget(request, softTokens: softTokens)
         }
         return ServerPreparedRequest(
             request: request,
-            requestID: requestID,
             promptIDs: request.multimodalMessages == nil ? try renderPrompt(request) : nil)
     }
 
@@ -992,8 +990,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         var calls: [ParsedToolCall] = []
         var decodingError: Error?
         var shouldStop = false
-        var decodeStartedLogged = false
-
+        
         completionStarted = true
         let result = try await runRawCompletion(
             producer: runner,
@@ -1007,10 +1004,6 @@ public actor ServerModelSession: ServerInferenceBackend {
             start: completionStart,
             shouldStop: { shouldStop }) { progress in
                 guard decodingError == nil else { return }
-                if !decodeStartedLogged {
-                    ServerLog.decodeStarted(id: prepared.requestID, promptTokens: effectivePromptIDs.count)
-                    decodeStartedLogged = true
-                }
                 do {
                     func handle(_ events: [StructuredAssistantEvent]) {
                         for event in events {
@@ -1029,8 +1022,10 @@ public actor ServerModelSession: ServerInferenceBackend {
                         }
                     }
                     switch progress {
-                    case .prefill:
-                        break
+                    case .prefill(let done, let total):
+                        // The chunked runner reports once per chunk, so each
+                        // line is a real progress boundary, not noise.
+                        onEvent(.prefill(done, total))
                     case .token(_, let tokenID, let delta):
                         let events = if let decoder {
                             try decoder.consume(tokenID: tokenID, delta: delta)
@@ -1063,7 +1058,7 @@ public actor ServerModelSession: ServerInferenceBackend {
                 kind: kind,
                 cause: cause,
                 diagnostics: StructuredOutputFailureDiagnostics(
-                    renderedPromptIDs: renderedPromptIDs ?? effectivePromptIDs,
+                    renderedPromptIDs: renderedPromptIDs,
                     effectivePromptIDs: effectivePromptIDs,
                     result: result,
                     maxCompletionTokens: config.maxNewTokens,
