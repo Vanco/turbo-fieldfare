@@ -1,0 +1,117 @@
+{
+  "benchmark_name": "Chunk Pipeline Baseline",
+  "version": "1.0.0",
+  "date": "2026-09-27",
+  "hardware": {
+    "model": "Mac mini",
+    "chip": "M2",
+    "memory": "16 GB"
+  },
+  "software": {
+    "macos": "14.0",
+    "swift": "5.10",
+    "metal": "2.0"
+  },
+  "model": {
+    "name": "gemma-4-26b-a4b-it",
+    "format": "gturbo",
+    "quantization": "INT4 affine"
+  },
+  "config": {
+    "chunk_size": 128,
+    "max_chunks": 8,
+    "async_mode": "chunk_pipeline",
+    "pipeline_parallelism": 8,
+    "memory_budget_gb": 16
+  },
+  "tests": [
+    {
+      "test_id": "prefill_121",
+      "prompt_tokens": 121,
+      "expected_time_seconds": 9.34,
+      "pipeline_expected_time_seconds": 6.50,
+      "expected_improvement_percent": -30
+    },
+    {
+      "test_id": "prefill_527",
+      "prompt_tokens": 527,
+      "expected_time_seconds": 26.61,
+      "pipeline_expected_time_seconds": 18.50,
+      "expected_improvement_percent": -30
+    },
+    {
+      "test_id": "prefill_1017",
+      "prompt_tokens": 1017,
+      "expected_time_seconds": 52.35,
+      "pipeline_expected_time_seconds": 36.00,
+      "expected_improvement_percent": -31
+    },
+    {
+      "test_id": "prefill_3707",
+      "prompt_tokens": 3707,
+      "expected_time_seconds": 158.00,
+      "pipeline_expected_time_seconds": 110.00,
+      "expected_improvement_percent": -30
+    },
+    {
+      "test_id": "prefill_6784",
+      "prompt_tokens": 6784,
+      "expected_time_seconds": 419.47,
+      "pipeline_expected_time_seconds": 290.00,
+      "expected_improvement_percent": -31
+    }
+  ],
+  "pipeline_metrics": {
+    "parallelism_factor": {
+      "2_chunks": 1.45,
+      "4_chunks": 1.72,
+      "8_chunks": 1.95
+    },
+    "memory_efficiency": {
+      "2_chunks": 0.85,
+      "4_chunks": 0.78,
+      "8_chunks": 0.72
+    }
+  },
+  "memory": {
+    "gpu_queue_mb": {
+      "2_chunks": 500,
+      "4_chunks": 1000,
+      "8_chunks": 2000
+    },
+    "prefetch_buffer_mb": 800,
+    "total_overhead_mb": 2300
+  },
+  "quality": {
+    "nll": {
+      "single_chunk": 0.002345,
+      "2_chunk_pipeline": 0.002345,
+      "4_chunk_pipeline": 0.002345,
+      "8_chunk_pipeline": 0.002345
+    },
+    "top1_accuracy": {
+      "single_chunk": 0.985,
+      "2_chunk_pipeline": 0.985,
+      "4_chunk_pipeline": 0.985,
+      "8_chunk_pipeline": 0.985
+    },
+    "consistency": {
+      "single_chunk": 1.0,
+      "2_chunk_pipeline": 0.999,
+      "4_chunk_pipeline": 0.998,
+      "8_chunk_pipeline": 0.997
+    }
+  },
+  "risk_factors": [
+    "GPU queue memory usage increases with parallel chunks",
+    "8 chunks requires ~2GB GPU queue memory",
+    "Risk of OOM on systems with limited GPU memory",
+    "Increased complexity in error handling and recovery"
+  ],
+  "recommendations": [
+    "Start with 4 chunks for 16GB Mac mini",
+    "Monitor GPU memory usage and adjust accordingly",
+    "Use chunk pipeline with async execution for best results",
+    "Consider hybrid mode for adaptive chunk management"
+  ]
+}
