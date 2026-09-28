@@ -2,8 +2,23 @@ import CryptoKit
 import Foundation
 import TurboFieldfare
 
+/// The model-cumulative routed-expert counters at a prefill boundary, with the
+/// totals the prefill started from.
+///
+/// The baseline is what makes a chunk's own cost readable. The counters are
+/// cumulative for the *model*, so a second request's counters already include
+/// everything the first request read. Without a baseline the first chunk of
+/// every request after the first would look as though it read nothing, and
+/// would be reported as healthy.
+public struct ServerPrefillIO: Equatable, Sendable {
+    public let cumulative: ExpertIOStats
+    public let baseline: ExpertIOStats
+}
+
 public enum ServerInferenceEvent: Equatable, Sendable {
-    case prefill(Int, Int)
+    /// `done`/`total` are token counts. The I/O counters are carried so the log
+    /// can separate an I/O bound prefill from a GPU bound one.
+    case prefill(Int, Int, ServerPrefillIO)
     case content(String)
     case toolCall(ParsedToolCall)
 }
@@ -991,6 +1006,12 @@ public actor ServerModelSession: ServerInferenceBackend {
         var shouldStop = false
         
         completionStarted = true
+        // `onProgress` is a non-Sendable closure, so it cannot capture the
+        // runner directly. A `@Sendable` reader keeps the capture Sendable.
+        let readExpertIO = { @Sendable () -> ExpertIOStats in self.runner.routedExpertIOStats() }
+        // Read once, before any prefill work, so every chunk — including the
+        // first of every request after the first — has a real delta.
+        let prefillIOBaseline = readExpertIO()
         let result = try await runRawCompletion(
             producer: runner,
             tokenizer: tokenizer,
@@ -1024,7 +1045,9 @@ public actor ServerModelSession: ServerInferenceBackend {
                     case .prefill(let done, let total):
                         // The chunked runner reports once per chunk, so each
                         // line is a real progress boundary, not noise.
-                        onEvent(.prefill(done, total))
+                        onEvent(.prefill(done, total,
+                                         ServerPrefillIO(cumulative: readExpertIO(),
+                                                         baseline: prefillIOBaseline)))
                     case .token(_, let tokenID, let delta):
                         let events = if let decoder {
                             try decoder.consume(tokenID: tokenID, delta: delta)

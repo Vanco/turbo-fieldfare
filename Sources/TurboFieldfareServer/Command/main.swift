@@ -44,7 +44,20 @@ do {
         backend: backend,
         visionCapability: backend.visionCapability)
     _ = try await server.start(port: arguments.port)
-    print("TurboFieldfareServer ready at http://127.0.0.1:\(arguments.port) model=\(arguments.modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue) vision=\(backend.visionCapability) vision_residency=\(arguments.visionResidency.rawValue)")
+    // The slot count and prefill chunk size are the two knobs that decide
+    // whether prefill is I/O bound, so the resolved values are printed rather
+    // than the requested ones.
+    let streaming: String
+    let slots: Int
+    switch arguments.expertStreamingMode {
+    case .pread(let count):
+        streaming = "pread"
+        slots = count
+    case .mmap(let count):
+        streaming = "mmap"
+        slots = count
+    }
+    print("TurboFieldfareServer ready at http://127.0.0.1:\(arguments.port) model=\(arguments.modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue) vision=\(backend.visionCapability) vision_residency=\(arguments.visionResidency.rawValue) expert_slots=\(slots) expert_streaming=\(streaming) prefill_chunk=\(arguments.prefillChunkTokens)")
 
     _ = await signals.wait()
     try await server.shutdown()

@@ -72,6 +72,9 @@ public protocol ExpertStreamer: Sendable {
     var slotCount: Int { get }
     var cachePolicy: ExpertCachePolicy { get }
     var diagnosticSlotScratchBytes: UInt64 { get }
+    /// Cumulative routed-expert traffic since load. Lets a caller tell an
+    /// I/O bound prefill from a GPU bound one without guessing from latency.
+    var ioStats: ExpertIOStats { get }
 
     func loadExpert(layer: Int, expert: Int) throws -> (buffer: MTLBuffer, offset: UInt64, size: UInt64)
     func loadExpert(layer: Int, expert: Int, slot: Int) throws -> (buffer: MTLBuffer, offset: UInt64, size: UInt64)

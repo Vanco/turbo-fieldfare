@@ -53,6 +53,40 @@ public enum ExpertCachePolicy: String, Sendable {
     case lfu
 }
 
+/// Cumulative routed-expert traffic for one layer's streamer. Chunked prefill
+/// re-sweeps a layer's expert region once per chunk, so these are the numbers
+/// that say whether a prefill is I/O bound: if `readNanos` tracks wall time,
+/// the GPU was never the constraint.
+public struct ExpertIOStats: Sendable, Equatable {
+    public var bytesRead: UInt64
+    public var readNanos: UInt64
+    public var missCount: Int
+    public var hitCount: Int
+
+    public init(bytesRead: UInt64 = 0,
+                readNanos: UInt64 = 0,
+                missCount: Int = 0,
+                hitCount: Int = 0) {
+        self.bytesRead = bytesRead
+        self.readNanos = readNanos
+        self.missCount = missCount
+        self.hitCount = hitCount
+    }
+
+    public static func + (lhs: ExpertIOStats, rhs: ExpertIOStats) -> ExpertIOStats {
+        ExpertIOStats(bytesRead: lhs.bytesRead &+ rhs.bytesRead,
+                      readNanos: lhs.readNanos &+ rhs.readNanos,
+                      missCount: lhs.missCount &+ rhs.missCount,
+                      hitCount: lhs.hitCount &+ rhs.hitCount)
+    }
+
+    /// Read throughput in bytes per second, or 0 when nothing was read.
+    public var bytesPerSecond: Double {
+        guard readNanos > 0 else { return 0 }
+        return Double(bytesRead) / (Double(readNanos) / 1e9)
+    }
+}
+
 /// `pread`-based routed-expert streamer with a fixed per-layer slot cache.
 public final class PreadExpertStreamer: @unchecked Sendable, ExpertStreamer {
     public static let scratchAlignment = 2 * 1024 * 1024
@@ -75,6 +109,11 @@ public final class PreadExpertStreamer: @unchecked Sendable, ExpertStreamer {
     private var expertUseCount: [Int]
     private var useClock = 0
     private let cacheLock = NSLock()
+
+    // Counters only. The read path takes `statsLock` around an arithmetic
+    // update, never across a pread, so this cannot serialize I/O.
+    private let statsLock = NSLock()
+    private var counters = ExpertIOStats()
 
     public convenience init(layout: StreamLayout,
                             device: MTLDevice,
@@ -191,10 +230,16 @@ public final class PreadExpertStreamer: @unchecked Sendable, ExpertStreamer {
         guard regionOffset + layout.expertStride <= layout.streamSize else {
             throw StreamerError.offsetOutOfRange(regionOffset)
         }
+        let start = DispatchTime.now().uptimeNanoseconds
         try readFull(
             into: slotPointers[slot],
             fileOffset: layout.streamOffset + regionOffset,
             count: Int(layout.expertStride))
+        statsLock.lock()
+        counters.bytesRead &+= layout.expertStride
+        counters.readNanos &+= DispatchTime.now().uptimeNanoseconds &- start
+        counters.missCount &+= 1
+        statsLock.unlock()
         return (slotBuffers[slot], 0, layout.expertStride)
     }
 
@@ -262,6 +307,12 @@ public final class PreadExpertStreamer: @unchecked Sendable, ExpertStreamer {
             slotLastUse[slot] = clock
         }
 
+        // The hit side of the cache ledger. Misses are counted where the
+        // bytes actually land, in `loadExpert`.
+        statsLock.lock()
+        counters.hitCount &+= experts.count - misses.count
+        statsLock.unlock()
+
         return ExpertCachePlan(
             experts: experts,
             assignedSlots: assignedSlots,
@@ -300,6 +351,13 @@ public final class PreadExpertStreamer: @unchecked Sendable, ExpertStreamer {
         cacheLock.unlock()
 
         return expertCachePlanBuffers(plan)
+    }
+
+    /// Cumulative traffic through this layer's streamer since load.
+    public var ioStats: ExpertIOStats {
+        statsLock.lock()
+        defer { statsLock.unlock() }
+        return counters
     }
 
     public func expertCachePlanBuffers(_ plan: ExpertCachePlan)
@@ -445,6 +503,11 @@ public final class MmapExpertStreamer: @unchecked Sendable, ExpertStreamer {
     private var useClock = 0
     private let cacheLock = NSLock()
 
+    // Counters only. `loadExpert` holds this around arithmetic, never
+    // across the memcpy, so it cannot serialize the copy path.
+    private let statsLock = NSLock()
+    private var counters = ExpertIOStats()
+
     public init(layout: StreamLayout,
                 device: MTLDevice,
                 slotCount: Int,
@@ -552,10 +615,18 @@ public final class MmapExpertStreamer: @unchecked Sendable, ExpertStreamer {
             throw StreamerError.offsetOutOfRange(regionOffset)
         }
 
-        // Copy from mmap'd region (page cache) to slot buffer
+        // Copy from mmap'd region (page cache) to slot buffer. The copy is
+        // where this backend pays for I/O: a page that is not resident faults
+        // in here, so timing it measures the same cost `pread` does.
         let src = mmapPtr.advanced(by: Int(regionOffset))
         let dst = slotPointers[slot]
+        let start = DispatchTime.now().uptimeNanoseconds
         memcpy(dst, src, Int(layout.expertStride))
+        statsLock.lock()
+        counters.bytesRead &+= layout.expertStride
+        counters.readNanos &+= DispatchTime.now().uptimeNanoseconds &- start
+        counters.missCount &+= 1
+        statsLock.unlock()
 
         return (slotBuffers[slot], 0, layout.expertStride)
     }
@@ -625,6 +696,12 @@ public final class MmapExpertStreamer: @unchecked Sendable, ExpertStreamer {
             slotLastUse[slot] = clock
         }
 
+        // The hit side of the cache ledger. Misses are counted where the
+        // bytes actually land, in `loadExpert`.
+        statsLock.lock()
+        counters.hitCount &+= experts.count - misses.count
+        statsLock.unlock()
+
         return ExpertCachePlan(
             experts: experts,
             assignedSlots: assignedSlots,
@@ -668,6 +745,13 @@ public final class MmapExpertStreamer: @unchecked Sendable, ExpertStreamer {
             results.append((slotBuffers[slot], 0, layout.expertStride))
         }
         return results
+    }
+
+    /// Cumulative traffic through this layer's streamer since load.
+    public var ioStats: ExpertIOStats {
+        statsLock.lock()
+        defer { statsLock.unlock() }
+        return counters
     }
 
     private func shouldEvictSlot(_ lhs: Int, before rhs: Int) -> Bool {

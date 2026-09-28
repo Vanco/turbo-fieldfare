@@ -89,3 +89,7 @@ model still runs green.
 Keep the image path fail-closed. If the pack is missing or invalid, say image
 support is unavailable. Never accept an image and then answer as though it had
 not been sent.
+
+## huggingface.co connect fail
+
+Use the following alternative: Local HTTP service, HF_ENDPOINT=http://127.0.0.1:8888. This way you can avoid test failures.

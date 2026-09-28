@@ -444,6 +444,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     public private(set) var totalRDAdviseFailures: UInt64 = 0
     public private(set) var totalRDAdviseSkipped: UInt64 = 0
 
+    /// Cumulative routed-expert traffic for the loaded model. `readNanos` is
+    /// summed across threads, so it is a cost total, not elapsed time; compare
+    /// it against wall time to see whether prefill is I/O bound.
+    public func routedExpertIOStats() -> ExpertIOStats {
+        model.routedExpertIOStats()
+    }
+
     private func recordRDAdvice(_ result: ExpertIOAdviceResult, wallNanos: UInt64) {
         totalRDAdviseNanos &+= wallNanos
         totalRDAdviseCalls &+= UInt64(result.calls)

@@ -17,6 +17,13 @@ public struct ServerArguments: Equatable, Sendable {
     public let visionPack: String?
     public let visionResidency: VisionResidencyPolicy
 
+    /// Which expert backend to use, independent of how many slots it gets.
+    /// The slot count always comes from `expertCacheSlots`.
+    enum ExpertStreamingBackend: Equatable, Sendable {
+        case pread
+        case mmap
+    }
+
 public static let usage = """
     usage: TurboFieldfareServer --model <completed .gturbo directory> [options]
 
@@ -93,7 +100,11 @@ public static let usage = """
         var visionResidency: VisionResidencyPolicy = .onDemand
         var expertCacheSlots = 16
         var expertCachePolicy = RuntimeExpertCachePolicy.lfu
-        var expertStreamingMode = ExpertStreamingMode.pread(slotCount: 16)
+        // Only the backend is tracked while parsing. The slot count is taken
+        // from `expertCacheSlots` when the mode is built at the end, so
+        // `--expert-cache-slots` reaches the streamer regardless of the order
+        // the two flags appear in.
+        var expertStreamingBackend = ExpertStreamingBackend.pread
         var prefillPolicy = RuntimePrefillPolicy.chunked
         var prefillChunkTokens = 128
         var rdadvisePolicy = RDAdvicePolicyMode.off
@@ -160,9 +171,9 @@ public static let usage = """
             case "--expert-streaming-mode":
                 switch value {
                 case "pread":
-                    expertStreamingMode = .pread(slotCount: expertCacheSlots)
+                    expertStreamingBackend = .pread
                 case "mmap":
-                    expertStreamingMode = .mmap(slotCount: expertCacheSlots)
+                    expertStreamingBackend = .mmap
                 default:
                     throw ServerArgumentError.invalid("--expert-streaming-mode must be pread or mmap")
                 }
@@ -205,6 +216,11 @@ public static let usage = """
             }
         }
         guard let model else { throw ServerArgumentError.invalid("--model is required") }
+        let expertStreamingMode: ExpertStreamingMode
+        switch expertStreamingBackend {
+        case .pread: expertStreamingMode = .pread(slotCount: expertCacheSlots)
+        case .mmap: expertStreamingMode = .mmap(slotCount: expertCacheSlots)
+        }
         return ServerArguments(model: model,
                                port: port,
                                modelID: modelID,

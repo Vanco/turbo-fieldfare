@@ -20,6 +20,13 @@ public struct Args: Equatable, Sendable {
     public var expertCacheSlots: Int
     public var expertCachePolicy: RuntimeExpertCachePolicy
     public var expertStreamingMode: ExpertStreamingMode
+
+    /// Which expert backend to use, independent of how many slots it gets.
+    /// The slot count always comes from `expertCacheSlots`.
+    enum RuntimeExpertStreamingBackend: Equatable, Sendable {
+        case pread
+        case mmap
+    }
     public var prefillPolicy: RuntimePrefillPolicy
     public var prefillChunkTokens: Int
     /// `--prefill-chunk-tokens auto`: the size is decided once the prompt length
@@ -234,7 +241,11 @@ extension Args {
         let runtimeDefaults = RuntimeConfiguration.production
         var expertCacheSlots = runtimeDefaults.expertCacheSlots
         var expertCachePolicy = runtimeDefaults.expertCachePolicy
-        var expertStreamingMode = ExpertStreamingMode.pread(slotCount: runtimeDefaults.expertCacheSlots)
+        // Only the backend is tracked while parsing. The slot count is taken
+        // from `expertCacheSlots` when the mode is built at the end, so
+        // `--expert-cache-slots` reaches the streamer regardless of the order
+        // the two flags appear in.
+        var expertStreamingBackend = RuntimeExpertStreamingBackend.pread
         var prefillPolicy = runtimeDefaults.prefillPolicy
         var prefillChunkTokens = runtimeDefaults.prefillChunkTokens
         var prefillChunkTokensAuto = false
@@ -332,9 +343,9 @@ extension Args {
                 let value = try takeValue(argv, &index, flag: flag)
                 switch value {
                 case "pread":
-                    expertStreamingMode = .pread(slotCount: expertCacheSlots)
+                    expertStreamingBackend = .pread
                 case "mmap":
-                    expertStreamingMode = .mmap(slotCount: expertCacheSlots)
+                    expertStreamingBackend = .mmap
                 default:
                     throw ArgsError.invalidValue(flag: flag, value: value)
                 }
@@ -440,9 +451,16 @@ extension Args {
                              seed: seed,
                              stops: stops,
 quiet: quiet,
-                              expertCacheSlots: expertCacheSlots,
-                              expertCachePolicy: expertCachePolicy,
-                              expertStreamingMode: expertStreamingMode,
+                               expertCacheSlots: expertCacheSlots,
+                               expertCachePolicy: expertCachePolicy,
+                               expertStreamingMode: {
+                                   switch expertStreamingBackend {
+                                   case .pread:
+                                       return .pread(slotCount: expertCacheSlots)
+                                   case .mmap:
+                                       return .mmap(slotCount: expertCacheSlots)
+                                   }
+                               }(),
                               prefillPolicy: prefillPolicy,
                               prefillChunkTokens: prefillChunkTokens,
                              prefillChunkTokensAuto: prefillChunkTokensAuto,

@@ -90,6 +90,18 @@ extension Model {
         return slotCount
     }
 
+    /// Cumulative routed-expert I/O across every layer opened so far. Layers
+    /// that have not been touched contribute nothing, so this grows with the
+    /// prompt rather than reporting the whole pool.
+    public func routedExpertIOStats() -> ExpertIOStats {
+        var total = ExpertIOStats()
+        let open: [ExpertStreamer] = streamersQueue.sync { streamersBox.streamers.compactMap { $0 } }
+        for streamer in open {
+            total = total + streamer.ioStats
+        }
+        return total
+    }
+
     public func routedExpertBuffers(for plan: RoutedExpertFetchPlan) throws -> [TensorView] {
         try ensureLayerOpened(plan.layer)
         let streamer = streamersQueue.sync { streamersBox.streamers[plan.layer]! }

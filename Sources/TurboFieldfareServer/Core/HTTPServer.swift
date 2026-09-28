@@ -376,6 +376,11 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                     }
                 }
                 let started = ContinuousClock.now
+                // Seeded from the request start so the first chunk has a
+                // baseline. Preparation is a render and a tokenize, which is
+                // negligible next to a chunk, so it does not distort the first
+                // ratio the way a second request's carried-over counters would.
+                let prefillIO = PrefillIOTracker(start: started)
                 ServerLog.accepted(id: responseID, streaming: request.stream)
                 do {
                     let completion = try await self.coordinator.runPreparing(
@@ -397,8 +402,14 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                             return try await self.backend.generate(prepared) { event in
                                 guard request.stream else { return }
                                 switch event {
-                                case .prefill(let done, let total):
-                                    ServerLog.prefill(id: responseID, actual: done, total: total)
+                                 case .prefill(let done, let total, let io):
+                                    ServerLog.prefill(
+                                        id: responseID,
+                                        actual: done,
+                                        total: total,
+                                        io: io.cumulative,
+                                        chunk: prefillIO.record(cumulative: io.cumulative,
+                                                                baseline: io.baseline))
                                 case .content(let text):
                                     self.writeStreamChunk(
                                         contextBox.value,
@@ -414,6 +425,9 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                                 }
                             }
                     })
+                    if let ioSummary = prefillIO.summary {
+                        ServerLog.prefillIOBound(id: responseID, summary: ioSummary)
+                    }
                     ServerLog.completed(id: responseID,
                                         duration: started.duration(to: .now),
                                         completion: completion)
