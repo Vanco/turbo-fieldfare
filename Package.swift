@@ -40,7 +40,8 @@ let package = Package(
             path: "Sources/TurboFieldfare",
             resources: [
                 .copy("Metal"),
-            ]
+            ],
+            
         ),
         .target(
             name: "TurboFieldfareRepackCore",
@@ -175,6 +176,12 @@ let package = Package(
             ],
             path: "Tests/TurboFieldfareServer",
             resources: [.copy("Fixtures")]
+        ),
+        .testTarget(
+            name: "AsyncTests",
+            dependencies: ["TurboFieldfare"],
+            path: "Tests/Async",
+            exclude: ["ExpertPredictorTests.swift", "ChunkPipelineManagerTests.swift"]
         ),
     ]
 )

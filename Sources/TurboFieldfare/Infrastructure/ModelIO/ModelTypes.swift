@@ -122,6 +122,7 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
     case indexCorrupt(detail: String)
     case posixFailed(call: String, errno: Int32)
     case trustedReceiptInvalid(detail: String)
+    case invalidLayerIndex(Int)
 
     public var description: String {
         switch self {
@@ -153,6 +154,8 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
             return "\(c) failed with errno \(e)"
         case .trustedReceiptInvalid(let detail):
             return "trusted install receipt invalid: \(detail)"
+        case .invalidLayerIndex(let idx):
+            return "invalid layer index: \(idx)"
         }
     }
 }

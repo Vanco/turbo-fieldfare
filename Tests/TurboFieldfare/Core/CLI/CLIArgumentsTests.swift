@@ -118,6 +118,9 @@ import TurboFieldfare
             "--expert-cache-policy", "--prefill", "--prefill-chunk-tokens",
             "--rdadvise", "--help",
             "--chat-prompt", "--image", "--vision-pack", "--vision-residency",
+            "--expert-streaming-mode",
+            "--draft-model", "--speculative-k", "--acceptance-strategy",
+            "--no-adaptive-k",
         ]
         let words = Args.usage.split { $0.isWhitespace || $0 == "(" || $0 == ")" }
         let options = Set(words.map(String.init).filter { $0.hasPrefix("--") })

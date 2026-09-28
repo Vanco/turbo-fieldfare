@@ -381,7 +381,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                     let completion = try await self.coordinator.runPreparing(
                         onQueued: onQueued,
                         prepare: {
-                            let prepared = try await self.backend.prepare(request, requestID: responseID)
+                            let prepared = try await self.backend.prepare(request)
                             phaseState.set("prepared")
                             ServerLog.prepared(id: responseID,
                                               promptTokens: prepared.promptTokenCount)

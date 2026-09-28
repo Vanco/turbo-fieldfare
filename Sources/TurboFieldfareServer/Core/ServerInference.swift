@@ -270,7 +270,7 @@ public protocol ServerInferenceBackend: Sendable {
 }
 
 public extension ServerInferenceBackend {
-    func prepare(_ request: ValidatedChatRequest, requestID: String) async throws -> ServerPreparedRequest {
+    func prepare(_ request: ValidatedChatRequest) async throws -> ServerPreparedRequest {
         ServerPreparedRequest(request: request)
     }
 
@@ -683,8 +683,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         _ request: ValidatedChatRequest,
         onEvent: @escaping @Sendable (ServerInferenceEvent) -> Void
     ) async throws -> ServerCompletion {
-        let requestID = UUID().uuidString
-        let prepared = try await prepare(request, requestID: requestID)
+        let prepared = try await prepare(request)
         return try await generate(prepared, onEvent: onEvent)
     }
 

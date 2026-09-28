@@ -156,6 +156,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
     private let fusedPostAttentionSetup: FusedPostAttentionSetup
     private let fusedTail: FusedLayerTail
 
+    // Async layer execution (seam for phase-one prefill optimization).
+    private let asyncLayerExecutor: AsyncLayerExecutor?
+
     // Prefill kernels. These are initialized once per runner so the chunk path
     // cannot accidentally rebuild PSOs inside a per-layer loop.
     private let prefillEmbed: PrefillEmbedLookupInt4
@@ -281,6 +284,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
         self.prefillLayerTail = try PrefillLayerTail(context: context)
         self.prefillFinalRowHead = try PrefillFinalRowHeadInt4(context: context,
                                                                maxD: cfg.hiddenSize)
+
+        self.asyncLayerExecutor = AsyncLayerExecutor(
+            queue: context.queue, numLayers: cfg.numLayers)
 
         let device = context.device
         let D = cfg.hiddenSize
@@ -1397,6 +1403,40 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
         prefillChunkState.markCommitted()
     }
 
+    /// Command buffers a layer leaves in flight for the next layer to drain.
+    fileprivate struct PendingRoutedCommand {
+        let cb: MTLCommandBuffer
+        let sharedCB: MTLCommandBuffer?
+        let phase1HitCB: MTLCommandBuffer?
+        let encodeAndCommitNanos: UInt64
+    }
+
+    private func finishPendingRoutedCommand(_ pending: PendingRoutedCommand,
+                                            waitIfNeeded: Bool) throws {
+        if waitIfNeeded {
+            if let sharedCB = pending.sharedCB {
+                waitUntilCompleted(sharedCB)
+            }
+            if let phase1HitCB = pending.phase1HitCB {
+                waitUntilCompleted(phase1HitCB)
+            }
+            waitUntilCompleted(pending.cb)
+        }
+        if let sharedCB = pending.sharedCB {
+            try checkCommandBufferError(sharedCB)
+        }
+        if let phase1HitCB = pending.phase1HitCB {
+            try checkCommandBufferError(phase1HitCB)
+        }
+        try checkCommandBufferError(pending.cb)
+        totalCb2Nanos &+= pending.encodeAndCommitNanos
+    }
+
+    private func writeActiveSlots(_ slots: [UInt32], into buffer: MTLBuffer) {
+        let ptr = buffer.contents().assumingMemoryBound(to: UInt32.self)
+        for i in 0..<slots.count { ptr[i] = slots[i] }
+    }
+
     private func produceToken(token: Int32,
                               position: Int,
                               into logits: MTLBuffer,
@@ -1415,39 +1455,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
         let FmoE = UInt32(cfg.moeIntermediateSize)
         let eps: Float = 1e-6
         let sqrtHidden = Float(cfg.hiddenSize).squareRoot()
-        struct PendingRoutedCommand {
-            let cb: MTLCommandBuffer
-            let sharedCB: MTLCommandBuffer?
-            let phase1HitCB: MTLCommandBuffer?
-            let encodeAndCommitNanos: UInt64
-        }
-        var pendingRoutedCommand: PendingRoutedCommand?
-
-        func finishPendingRoutedCommand(_ pending: PendingRoutedCommand,
-                                        waitIfNeeded: Bool) throws {
-            if waitIfNeeded {
-                if let sharedCB = pending.sharedCB {
-                    waitUntilCompleted(sharedCB)
-                }
-                if let phase1HitCB = pending.phase1HitCB {
-                    waitUntilCompleted(phase1HitCB)
-                }
-                waitUntilCompleted(pending.cb)
-            }
-            if let sharedCB = pending.sharedCB {
-                try checkCommandBufferError(sharedCB)
-            }
-            if let phase1HitCB = pending.phase1HitCB {
-                try checkCommandBufferError(phase1HitCB)
-            }
-            try checkCommandBufferError(pending.cb)
-            totalCb2Nanos &+= pending.encodeAndCommitNanos
-        }
-
-        func writeActiveSlots(_ slots: [UInt32], into buffer: MTLBuffer) {
-            let ptr = buffer.contents().assumingMemoryBound(to: UInt32.self)
-            for i in 0..<slots.count { ptr[i] = slots[i] }
-        }
 
         // Embed lookup + sqrt(H) fused.
         let emb = model.embedding
@@ -1464,397 +1471,22 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
             }
         }
 
-        for L in 0..<cfg.numLayers {
-            let isFull = cfg.fullAttentionLayerMask[L] != 0
-            let headDimL = isFull ? cfg.fullHeadDim : cfg.headDim
-            let numKVL   = isFull ? cfg.numFullKVHeads : cfg.numKVHeads
-            let qDim     = UInt32(cfg.numHeads * headDimL)
-            let kvDim    = UInt32(numKVL * headDimL)
-            let kSlot    = kv?.kSlot(layer: L, position: position) ?? (buffer: kStage, offset: 0)
-            let vSlot    = kv?.vSlot(layer: L, position: position) ?? (buffer: vStage, offset: 0)
-            let seqLen   = UInt32(position + 1)
-
-            let inNorm   = try model.inputNorm(layer: L)
-            let q        = try model.qProj(layer: L)
-            let k        = try model.kProj(layer: L)
-            // v_proj only exists on SWA layers; full layers reuse k_proj.
-            let vProj    = isFull ? k : (try model.vProj(layer: L))
-            let o        = try model.oProj(layer: L)
-            let postAttn = try model.postAttnNorm(layer: L)
-            let qNorm    = try model.qNorm(layer: L)
-            let kNorm    = try model.kNorm(layer: L)
-            let preFFN   = try model.preFFN(layer: L)
-            let preFFN2  = try model.preFFN2(layer: L)
-            let sharedProj = sharedExpertProjections[L]
-            let postF2   = try model.postFFN2(layer: L)
-            let postF    = try model.postFFN(layer: L)
-            let routerW  = try model.router(layer: L)
-            let perExpertScale = try model.routerPerExpertScale(layer: L)
-            let layerScalarView = try model.layerScalar(layer: L)
-
-            let tCb1Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            // Everything up to and including the router runs in a single CB:
-            // the only reason to break is the CPU readback of router indices
-            // needed to issue I/O for the routed-expert blobs.
-            let gInputNorm: (MTLCommandBuffer) -> Void = { [self] cb in
-                rms.encodeBF16W(commandBuffer: cb,
-                                x: hidden,
-                                weight: inNorm.buffer, weightOffset: Int(inNorm.offset),
-                                out: normed,
-                                d: D, eps: eps)
-            }
-
-            let gQKV: (MTLCommandBuffer) -> Void = { [self] cb in
-                fusedQKVGEMV.encode(commandBuffer: cb,
-                                    qWeights: q.buffer, qWeightsOffset: Int(q.offset),
-                                    qScales: q.buffer, qScalesOffset: Int(q.scaleOffset),
-                                    qBiases: q.buffer, qBiasesOffset: Int(q.biasOffset),
-                                    kWeights: k.buffer, kWeightsOffset: Int(k.offset),
-                                    kScales: k.buffer, kScalesOffset: Int(k.scaleOffset),
-                                    kBiases: k.buffer, kBiasesOffset: Int(k.biasOffset),
-                                    vWeights: vProj.buffer, vWeightsOffset: Int(vProj.offset),
-                                    vScales: vProj.buffer, vScalesOffset: Int(vProj.scaleOffset),
-                                    vBiases: vProj.buffer, vBiasesOffset: Int(vProj.biasOffset),
-                                    x: normed,
-                                    qOut: qScratch,
-                                    kOut: kSlot.buffer, kOutOffset: kSlot.offset,
-                                    vOut: vSlot.buffer, vOutOffset: vSlot.offset,
-                                    qRows: qDim,
-                                    kvRows: kvDim,
-                                    n: D)
-            }
-
-            let gQKVEpilogue: (MTLCommandBuffer) -> Void = { [self] cb in
-                let rotated = isFull
-                    ? UInt32(Double(cfg.fullHeadDim) * cfg.partialRotaryFactor / 2.0)
-                    : UInt32(headDimL / 2)
-                fusedQKVEpilogue.encode(commandBuffer: cb,
-                                        q: qScratch,
-                                        k: kSlot.buffer,
-                                        kOffset: kSlot.offset,
-                                        v: vSlot.buffer,
-                                        vOffset: vSlot.offset,
-                                        qWeight: qNorm.buffer,
-                                        qWeightOffset: Int(qNorm.offset),
-                                        kWeight: kNorm.buffer,
-                                        kWeightOffset: Int(kNorm.offset),
-                                        headDim: UInt32(headDimL),
-                                        numQHeads: UInt32(cfg.numHeads),
-                                        numKVHeads: UInt32(numKVL),
-                                        position: UInt32(position),
-                                        theta: isFull ? Float(cfg.fullRopeTheta) : Float(cfg.ropeTheta),
-                                        rotatedPairs: rotated,
-                                        eps: eps)
-            }
-
-            let gAttention: (MTLCommandBuffer) -> Void = { [self] cb in
-                guard kv != nil else {
-                    preconditionFailure("FP16 attention requires an FP16 KV cache")
-                }
-                if isFull {
-                    attention.encodeFull(commandBuffer: cb,
-                                         q: qScratch,
-                                         k: kSlot.buffer, kOffset: 0,
-                                         v: vSlot.buffer, vOffset: 0,
-                                         out: attnOut,
-                                         headDim: UInt32(headDimL),
-                                         numQHeads: UInt32(cfg.numHeads),
-                                         numKVHeads: UInt32(numKVL),
-                                         seqLen: seqLen,
-                                         scale: 1.0)
-                } else {
-                    let ringCapacity = kv?.ringCapacity(layer: L) ?? 0
-                    let activeRingCapacity = ringCapacity > 0 && Int(seqLen) > ringCapacity
-                        ? UInt32(ringCapacity)
-                        : 0
-                    attention.encodeSWA(commandBuffer: cb,
-                                        q: qScratch,
-                                        k: kSlot.buffer, kOffset: 0,
-                                        v: vSlot.buffer, vOffset: 0,
-                                        out: attnOut,
-                                        headDim: UInt32(headDimL),
-                                        numQHeads: UInt32(cfg.numHeads),
-                                        numKVHeads: UInt32(numKVL),
-                                        seqLen: seqLen,
-                                        window: UInt32(cfg.slidingWindow),
-                                        scale: 1.0,
-                                        ringCapacity: activeRingCapacity)
-                }
-            }
-            let gOProj: (MTLCommandBuffer) -> Void = { [self] cb in
-                int4.encode(commandBuffer: cb,
-                            weights: o.buffer, weightsOffset: Int(o.offset),
-                            scales:  o.buffer, scalesOffset:  Int(o.scaleOffset),
-                            biases:  o.buffer, biasesOffset:  Int(o.biasOffset),
-                            x: attnOut, y: oOut, m: D, n: qDim)
-            }
-
-            let gPostAttnSetup: (MTLCommandBuffer) -> Void = { [self] cb in
-                fusedPostAttentionSetup.encode(commandBuffer: cb,
-                                               hidden: hidden,
-                                               attn: oOut,
-                                               denseX: denseX,
-                                               routedX: routedX,
-                                               routerX: routerInput,
-                                               postAttentionWeight: postAttn.buffer,
-                                               postAttentionWeightOffset: Int(postAttn.offset),
-                                               preFFNWeight: preFFN.buffer,
-                                               preFFNWeightOffset: Int(preFFN.offset),
-                                               preFFN2Weight: preFFN2.buffer,
-                                               preFFN2WeightOffset: Int(preFFN2.offset),
-                                               d: D,
-                                               eps: eps)
-            }
-
-            let gRouter: (MTLCommandBuffer) -> Void = { [self] cb in
-                moe.encodeRouterGemma4(commandBuffer: cb,
-                    weights: routerW.buffer, weightsOffset: Int(routerW.offset),
-                    scales:  routerW.buffer, scalesOffset:  Int(routerW.scaleOffset),
-                    biases:  routerW.buffer, biasesOffset:  Int(routerW.biasOffset),
-                    hidden: routerInput,
-                    effectiveScale: effectiveScaleBuffers[L],
-                    perExpertScale: perExpertScale.buffer,
-                    perExpertScaleOffset: Int(perExpertScale.offset),
-                    outIndices: outIndices, outWeights: outWeights,
-                    numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
-            }
-
-            let cb = ctx.queue.makeCommandBuffer()!
-            gInputNorm(cb)
-            gQKV(cb)
-            gQKVEpilogue(cb)
-            gAttention(cb)
-            gOProj(cb)
-            gPostAttnSetup(cb)
-            gRouter(cb)
-            cb.commit()
-            let tWait = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            waitUntilCompleted(cb)
-            let waitNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tWait
-            if let pending = pendingRoutedCommand {
-                try finishPendingRoutedCommand(pending, waitIfNeeded: false)
-                pendingRoutedCommand = nil
-            }
-            try checkCommandBufferError(cb)
-            totalCb1Nanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb1Start - waitNanos
-
-            // CPU readback to fetch routed-expert blobs from disk.
-            let idxPtr = outIndices.contents().bindMemory(to: UInt32.self,
-                                                          capacity: cfg.topKExperts)
-            var experts = [Int](repeating: 0, count: cfg.topKExperts)
-            for i in 0..<cfg.topKExperts {
-                experts[i] = min(Int(idxPtr[i]), cfg.numExperts - 1)
-            }
-
-            let routedOffsets = model.routedExpertOffsets(layer: L)
-            let topK = UInt32(cfg.topKExperts)
-            let canPlanPhase1HitSplit =
-                cfg.topKExperts <= MoE.maxStreamedExperts
-            let plannedFetch = canPlanPhase1HitSplit
-                ? try model.planRoutedExperts(layer: L, experts: experts)
-                : nil
-            var phase1HitCB: MTLCommandBuffer?
-            var phase1HitSplitArgBuf: MTLBuffer?
-            var phase1HitSplitRoutedBufs: [MTLBuffer] = []
-            var phase1HitSlots: [UInt32] = []
-            var phase1MissSlots: [UInt32] = []
-
-            if let plan = plannedFetch {
-                let missSet = Set(plan.misses)
-                phase1HitSlots = (0..<cfg.topKExperts)
-                    .filter { !missSet.contains($0) }
-                    .map { UInt32($0) }
-                phase1MissSlots = plan.misses.map { UInt32($0) }
-            }
-            func encodeRoutedPhase1Full(
-                _ cb: MTLCommandBuffer,
-                argBuf: MTLBuffer,
-                routedBufs: [MTLBuffer]
-            ) {
-                moe.encodeRoutedPersistentPhase1U16Load(commandBuffer: cb,
-                                                        routedArgBuffer: argBuf,
-                                                        routedBlobs: routedBufs,
-                                                        routedOffsets: routedOffsets,
-                                                        x: routedX,
-                                                        acts: moeActs,
-                                                        d: D,
-                                                        f: FmoE,
-                                                        topK: topK)
-            }
-
-            func encodeRoutedPhase1Subset(
-                _ cb: MTLCommandBuffer,
-                argBuf: MTLBuffer,
-                routedBufs: [MTLBuffer],
-                activeSlots: MTLBuffer,
-                activeSlotIndices: [UInt32],
-                activeCount: UInt32
-            ) {
-                moe.encodeRoutedPersistentPhase1SubsetU16Load(
-                    commandBuffer: cb,
-                    routedArgBuffer: argBuf,
-                    routedBlobs: routedBufs,
-                    routedOffsets: routedOffsets,
-                    x: routedX,
-                    acts: moeActs,
-                    activeSlots: activeSlots,
-                    activeSlotIndices: activeSlotIndices,
-                    activeCount: activeCount,
-                    d: D,
-                    f: FmoE,
-                    topK: topK)
-            }
-
-            if let plan = plannedFetch,
-               plan.hits > 0,
-               !plan.misses.isEmpty {
-                let plannedBlobs = try model.routedExpertBuffers(for: plan)
-                phase1HitSplitRoutedBufs = plannedBlobs.map { $0.buffer }
-                phase1HitSplitArgBuf = moe.makeRoutedArgumentBuffer(
-                    routedBlobs: phase1HitSplitRoutedBufs,
-                    topK: topK)
-                if let argBuf = phase1HitSplitArgBuf, plan.hits > 0, !plan.misses.isEmpty {
-                    writeActiveSlots(phase1HitSlots, into: moeHitActiveSlots)
-                    let cb = ctx.queue.makeCommandBuffer()!
-                    encodeRoutedPhase1Subset(
-                        cb,
-                        argBuf: argBuf,
-                        routedBufs: phase1HitSplitRoutedBufs,
-                        activeSlots: moeHitActiveSlots,
-                        activeSlotIndices: phase1HitSlots,
-                        activeCount: UInt32(phase1HitSlots.count))
-                    phase1HitCB = cb
-                }
-            }
-
-            // The shared dense MLP depends only on denseX, not on the routed
-            // experts. Commit it without waiting so its GPU work overlaps the
-            // routed-expert pread. The routed CB follows it on the same queue,
-            // so the combine sees h1Buf.
-            let gSharedFFN: (MTLCommandBuffer) -> Void = { [self] cb in
-                try! shared.encode(commandBuffer: cb,
-                                   x: denseX,
-                                   gate: sharedProj.gate,
-                                   up: sharedProj.up,
-                                   down: sharedProj.down,
-                                   y: h1Buf,
-                                   scratchGate: denseScratchGate,
-                                   scratchUp: denseScratchUp,
-                                   scratchAct: denseScratchAct)
-            }
-            let gSharedNorm: (MTLCommandBuffer) -> Void = { [self] cb in
-                rms.encodeBF16W(commandBuffer: cb, x: h1Buf,
-                                weight: sharedProj.postF1.buffer,
-                                weightOffset: Int(sharedProj.postF1.offset),
-                                out: h1Buf, d: D, eps: eps)
-            }
-            let sharedCB = ctx.queue.makeCommandBuffer()!
-            gSharedFFN(sharedCB)
-            gSharedNorm(sharedCB)
-            sharedCB.commit()
-            if let cb = phase1HitCB {
-                cb.commit()
-            }
-            if rdadviseEnabled && rdadvisePolicyMode != .off {
-                let requestedMisses = plannedFetch?.misses.count ?? experts.count
-                let estimatedAdviceBytes = try model.routedExpertAdviceByteEstimate(
-                    layer: L,
-                    missCount: requestedMisses)
-                if let skipped = shouldSkipRDAdvice(position: position,
-                                                    requestedMisses: requestedMisses,
-                                                    estimatedBytes: estimatedAdviceBytes,
-                                                    canOverlapUsefulGPUWork: true) {
-                    recordRDAdvice(skipped, wallNanos: 0)
-                } else {
-                    let tAdvice = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-                    let result: ExpertIOAdviceResult
-                    if let plannedFetch {
-                        result = try model.adviseRoutedExperts(plan: plannedFetch)
-                    } else {
-                        result = try model.adviseRoutedExperts(layer: L, experts: experts)
-                    }
-                    let wallNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tAdvice
-                    recordRDAdvice(result, wallNanos: wallNanos)
-                    updateRDAdvicePolicy(after: result, position: position)
-                }
-            }
-
-            // Routed-expert pread — overlaps the shared MLP GPU work above.
-            let tIoStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            let blobs: [TensorView]
-            if let plannedFetch {
-                blobs = try await model.fetchRoutedExperts(plan: plannedFetch)
-            } else {
-                blobs = try await model.fetchRoutedExperts(layer: L, experts: experts)
-            }
-            let layerIo = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tIoStart
-            totalIoNanos &+= layerIo
-            let routedBufs = blobs.map { $0.buffer }
-            let tCb2Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            let scalarPtr = layerScalarView.buffer.contents()
-                .advanced(by: Int(layerScalarView.offset))
-                .assumingMemoryBound(to: UInt16.self)
-            let layerScalar = Quantization.bf16ToFloat(scalarPtr[0])
-
-            let gTail: (MTLCommandBuffer) -> Void = { [self] cb in
-                fusedTail.encode(commandBuffer: cb,
-                                 h2: h2Buf,
-                                 h1: h1Buf,
-                                 hidden: hidden,
-                                 postFFN2Weight: postF2.buffer,
-                                 postFFN2WeightOffset: Int(postF2.offset),
-                                 postFFNWeight: postF.buffer,
-                                 postFFNWeightOffset: Int(postF.offset),
-                                 d: D,
-                                 eps: eps,
-                                 layerScalar: layerScalar)
-            }
-            let routedCB = ctx.queue.makeCommandBuffer()!
-            let splitArgBuf = phase1HitCB != nil && !phase1MissSlots.isEmpty
-                ? phase1HitSplitArgBuf
-                : nil
-            let argBuf = splitArgBuf ?? moe.makeReusedRoutedArgumentBuffer(
-                routedBlobs: routedBufs,
-                topK: topK)
-            if splitArgBuf != nil {
-                writeActiveSlots(phase1MissSlots, into: moeMissActiveSlots)
-                encodeRoutedPhase1Subset(
-                    routedCB,
-                    argBuf: argBuf,
-                    routedBufs: routedBufs,
-                    activeSlots: moeMissActiveSlots,
-                    activeSlotIndices: phase1MissSlots,
-                    activeCount: UInt32(phase1MissSlots.count))
-            } else {
-                encodeRoutedPhase1Full(routedCB,
-                                       argBuf: argBuf,
-                                       routedBufs: routedBufs)
-            }
-            moe.encodeRoutedPersistentPhase2Reduce(commandBuffer: routedCB,
-                                                   routedArgBuffer: argBuf,
-                                                   routedBlobs: routedBufs,
-                                                   routedOffsets: routedOffsets,
-                                                   acts: moeActs,
-                                                   routingWeights: outWeights,
-                                                   residual: zeroResidual,
-                                                   y: h2Buf,
-                                                   d: D,
-                                                   f: FmoE,
-                                                   topK: topK)
-            gTail(routedCB)
-            routedCB.commit()
-            precondition(pendingRoutedCommand == nil,
-                         "routed command-buffer pipeline drained before queuing the next layer")
-            pendingRoutedCommand = PendingRoutedCommand(
-                cb: routedCB,
-                sharedCB: sharedCB,
-                phase1HitCB: phase1HitCB,
-                encodeAndCommitNanos: clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb2Start)
-            continue
+        // One command queue, one commit order. The executor keeps the layer
+        // dependency chain explicit and threads the previous layer's pending
+        // command buffers through as state, so nothing is dropped between
+        // layers. The async hop is what lets the caller stay off this thread.
+        let layerExecutor = asyncLayerExecutor ?? AsyncLayerExecutor(
+            queue: ctx.queue, numLayers: cfg.numLayers)
+        let drained = try await layerExecutor.runLayers(
+            0..<cfg.numLayers,
+            initial: nil as PendingRoutedCommand?
+        ) { layer, previous in
+            try await self.runDecoderLayer(layer,
+                                          position: position,
+                                          draining: previous)
         }
-        if let pending = pendingRoutedCommand {
+        if let pending = drained {
             try finishPendingRoutedCommand(pending, waitIfNeeded: true)
-            pendingRoutedCommand = nil
         }
 
         // The fused head skips the vocab buffer and leaves a greedy token in
@@ -1903,6 +1535,424 @@ public final class RealForwardRunner: ChunkedPrefillRunner, MultimodalPrefillRun
 
         kv?.advance()
     }
+
+    /// Runs one decoder layer and returns the routed command buffers that the
+    /// next layer is allowed to drain. `draining` is the previous layer's
+    /// pending work; it is error-checked here and waited on only at the end of
+    /// the stack so GPU work for this layer overlaps the previous layer's tail.
+    private func runDecoderLayer(
+        _ layer: Int,
+        position: Int,
+        draining previous: PendingRoutedCommand?
+    ) async throws -> PendingRoutedCommand {
+        var draining = previous
+        let L = layer
+        let D    = UInt32(cfg.hiddenSize)
+        let FmoE = UInt32(cfg.moeIntermediateSize)
+        let eps: Float = 1e-6
+        let isFull = cfg.fullAttentionLayerMask[L] != 0
+        let headDimL = isFull ? cfg.fullHeadDim : cfg.headDim
+        let numKVL   = isFull ? cfg.numFullKVHeads : cfg.numKVHeads
+        let qDim     = UInt32(cfg.numHeads * headDimL)
+        let kvDim    = UInt32(numKVL * headDimL)
+        let kSlot    = kv?.kSlot(layer: L, position: position) ?? (buffer: kStage, offset: 0)
+        let vSlot    = kv?.vSlot(layer: L, position: position) ?? (buffer: vStage, offset: 0)
+        let seqLen   = UInt32(position + 1)
+
+        let inNorm   = try model.inputNorm(layer: L)
+        let q        = try model.qProj(layer: L)
+        let k        = try model.kProj(layer: L)
+        // v_proj only exists on SWA layers; full layers reuse k_proj.
+        let vProj    = isFull ? k : (try model.vProj(layer: L))
+        let o        = try model.oProj(layer: L)
+        let postAttn = try model.postAttnNorm(layer: L)
+        let qNorm    = try model.qNorm(layer: L)
+        let kNorm    = try model.kNorm(layer: L)
+        let preFFN   = try model.preFFN(layer: L)
+        let preFFN2  = try model.preFFN2(layer: L)
+        let sharedProj = sharedExpertProjections[L]
+        let postF2   = try model.postFFN2(layer: L)
+        let postF    = try model.postFFN(layer: L)
+        let routerW  = try model.router(layer: L)
+        let perExpertScale = try model.routerPerExpertScale(layer: L)
+        let layerScalarView = try model.layerScalar(layer: L)
+
+        let tCb1Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        // Everything up to and including the router runs in a single CB:
+        // the only reason to break is the CPU readback of router indices
+        // needed to issue I/O for the routed-expert blobs.
+        let gInputNorm: (MTLCommandBuffer) -> Void = { [self] cb in
+            rms.encodeBF16W(
+                commandBuffer: cb,
+                x: hidden,
+                weight: inNorm.buffer,
+                weightOffset: Int(inNorm.offset),
+                out: normed,
+                d: D,
+                eps: eps)
+        }
+
+        let gQKV: (MTLCommandBuffer) -> Void = { [self] cb in
+            fusedQKVGEMV.encode(
+                commandBuffer: cb,
+                qWeights: q.buffer, qWeightsOffset: Int(q.offset),
+                qScales: q.buffer, qScalesOffset: Int(q.scaleOffset),
+                qBiases: q.buffer, qBiasesOffset: Int(q.biasOffset),
+                kWeights: k.buffer, kWeightsOffset: Int(k.offset),
+                kScales: k.buffer, kScalesOffset: Int(k.scaleOffset),
+                kBiases: k.buffer, kBiasesOffset: Int(k.biasOffset),
+                vWeights: vProj.buffer, vWeightsOffset: Int(vProj.offset),
+                vScales: vProj.buffer, vScalesOffset: Int(vProj.scaleOffset),
+                vBiases: vProj.buffer, vBiasesOffset: Int(vProj.biasOffset),
+                x: normed,
+                qOut: qScratch,
+                kOut: kSlot.buffer, kOutOffset: kSlot.offset,
+                vOut: vSlot.buffer, vOutOffset: vSlot.offset,
+                qRows: qDim,
+                kvRows: kvDim,
+                n: D)
+        }
+
+        let gQKVEpilogue: (MTLCommandBuffer) -> Void = { [self] cb in
+            let rotated = isFull
+                ? UInt32(Double(cfg.fullHeadDim) * cfg.partialRotaryFactor / 2.0)
+                : UInt32(headDimL / 2)
+            fusedQKVEpilogue.encode(
+                commandBuffer: cb,
+                q: qScratch,
+                k: kSlot.buffer,
+                kOffset: kSlot.offset,
+                v: vSlot.buffer,
+                vOffset: vSlot.offset,
+                qWeight: qNorm.buffer,
+                qWeightOffset: Int(qNorm.offset),
+                kWeight: kNorm.buffer,
+                kWeightOffset: Int(kNorm.offset),
+                headDim: UInt32(headDimL),
+                numQHeads: UInt32(cfg.numHeads),
+                numKVHeads: UInt32(numKVL),
+                position: UInt32(position),
+                theta: isFull ? Float(cfg.fullRopeTheta) : Float(cfg.ropeTheta),
+                rotatedPairs: rotated,
+                eps: eps)
+        }
+
+        let gAttention: (MTLCommandBuffer) -> Void = { [self] cb in
+            guard kv != nil else {
+                preconditionFailure("FP16 attention requires an FP16 KV cache")
+            }
+            if isFull {
+                attention.encodeFull(
+                    commandBuffer: cb,
+                     q: qScratch,
+                     k: kSlot.buffer, kOffset: 0,
+                     v: vSlot.buffer, vOffset: 0,
+                     out: attnOut,
+                     headDim: UInt32(headDimL),
+                     numQHeads: UInt32(cfg.numHeads),
+                     numKVHeads: UInt32(numKVL),
+                     seqLen: seqLen,
+                     scale: 1.0)
+            } else {
+                let ringCapacity = kv?.ringCapacity(layer: L) ?? 0
+                let activeRingCapacity = ringCapacity > 0 && Int(seqLen) > ringCapacity
+                    ? UInt32(ringCapacity)
+                    : 0
+                attention.encodeSWA(
+                    commandBuffer: cb,
+                    q: qScratch,
+                    k: kSlot.buffer, kOffset: 0,
+                    v: vSlot.buffer, vOffset: 0,
+                    out: attnOut,
+                    headDim: UInt32(headDimL),
+                    numQHeads: UInt32(cfg.numHeads),
+                    numKVHeads: UInt32(numKVL),
+                    seqLen: seqLen,
+                    window: UInt32(cfg.slidingWindow),
+                    scale: 1.0,
+                    ringCapacity: activeRingCapacity)
+            }
+        }
+        let gOProj: (MTLCommandBuffer) -> Void = { [self] cb in
+            int4.encode(
+                commandBuffer: cb,
+                weights: o.buffer, weightsOffset: Int(o.offset),
+                scales:  o.buffer, scalesOffset:  Int(o.scaleOffset),
+                biases:  o.buffer, biasesOffset:  Int(o.biasOffset),
+                x: attnOut, y: oOut, m: D, n: qDim)
+        }
+
+        let gPostAttnSetup: (MTLCommandBuffer) -> Void = { [self] cb in
+            fusedPostAttentionSetup.encode(
+                commandBuffer: cb,
+                hidden: hidden,
+                attn: oOut,
+                denseX: denseX,
+                routedX: routedX,
+                routerX: routerInput,
+                postAttentionWeight: postAttn.buffer,
+                postAttentionWeightOffset: Int(postAttn.offset),
+                preFFNWeight: preFFN.buffer,
+                preFFNWeightOffset: Int(preFFN.offset),
+                preFFN2Weight: preFFN2.buffer,
+                preFFN2WeightOffset: Int(preFFN2.offset),
+                d: D,
+                eps: eps)
+        }
+
+        let gRouter: (MTLCommandBuffer) -> Void = { [self] cb in
+            moe.encodeRouterGemma4(commandBuffer: cb,
+                weights: routerW.buffer, weightsOffset: Int(routerW.offset),
+                scales:  routerW.buffer, scalesOffset:  Int(routerW.scaleOffset),
+                biases:  routerW.buffer, biasesOffset:  Int(routerW.biasOffset),
+                hidden: routerInput,
+                effectiveScale: effectiveScaleBuffers[L],
+                perExpertScale: perExpertScale.buffer,
+                perExpertScaleOffset: Int(perExpertScale.offset),
+                outIndices: outIndices, outWeights: outWeights,
+                numExperts: UInt32(cfg.numExperts), d: D, topK: UInt32(cfg.topKExperts))
+        }
+
+        let cb = ctx.queue.makeCommandBuffer()!
+        gInputNorm(cb)
+        gQKV(cb)
+        gQKVEpilogue(cb)
+        gAttention(cb)
+        gOProj(cb)
+        gPostAttnSetup(cb)
+        gRouter(cb)
+        cb.commit()
+        let tWait = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        waitUntilCompleted(cb)
+        let waitNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tWait
+        if let carried = draining {
+            try finishPendingRoutedCommand(carried, waitIfNeeded: false)
+            draining = nil
+        }
+        try checkCommandBufferError(cb)
+        totalCb1Nanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb1Start - waitNanos
+
+        // CPU readback to fetch routed-expert blobs from disk.
+        let idxPtr = outIndices.contents().bindMemory(to: UInt32.self,
+                                                      capacity: cfg.topKExperts)
+        var experts = [Int](repeating: 0, count: cfg.topKExperts)
+        for i in 0..<cfg.topKExperts {
+            experts[i] = min(Int(idxPtr[i]), cfg.numExperts - 1)
+        }
+
+        let routedOffsets = model.routedExpertOffsets(layer: L)
+        let topK = UInt32(cfg.topKExperts)
+        let canPlanPhase1HitSplit =
+            cfg.topKExperts <= MoE.maxStreamedExperts
+        let plannedFetch = canPlanPhase1HitSplit
+            ? try model.planRoutedExperts(layer: L, experts: experts)
+            : nil
+        var phase1HitCB: MTLCommandBuffer?
+        var phase1HitSplitArgBuf: MTLBuffer?
+        var phase1HitSplitRoutedBufs: [MTLBuffer] = []
+        var phase1HitSlots: [UInt32] = []
+        var phase1MissSlots: [UInt32] = []
+
+        if let plan = plannedFetch {
+            let missSet = Set(plan.misses)
+            phase1HitSlots = (0..<cfg.topKExperts)
+                .filter { !missSet.contains($0) }
+                .map { UInt32($0) }
+            phase1MissSlots = plan.misses.map { UInt32($0) }
+        }
+        func encodeRoutedPhase1Full(
+            _ cb: MTLCommandBuffer,
+            argBuf: MTLBuffer,
+            routedBufs: [MTLBuffer]
+        ) {
+            moe.encodeRoutedPersistentPhase1U16Load(
+                commandBuffer: cb,
+                routedArgBuffer: argBuf,
+                routedBlobs: routedBufs,
+                routedOffsets: routedOffsets,
+                x: routedX,
+                acts: moeActs,
+                d: D,
+                f: FmoE,
+                topK: topK)
+        }
+
+        func encodeRoutedPhase1Subset(
+            _ cb: MTLCommandBuffer,
+            argBuf: MTLBuffer,
+            routedBufs: [MTLBuffer],
+            activeSlots: MTLBuffer,
+            activeSlotIndices: [UInt32],
+            activeCount: UInt32
+        ) {
+            moe.encodeRoutedPersistentPhase1SubsetU16Load(
+                commandBuffer: cb,
+                routedArgBuffer: argBuf,
+                routedBlobs: routedBufs,
+                routedOffsets: routedOffsets,
+                x: routedX,
+                acts: moeActs,
+                activeSlots: activeSlots,
+                activeSlotIndices: activeSlotIndices,
+                activeCount: activeCount,
+                d: D,
+                f: FmoE,
+                topK: topK)
+        }
+
+        if let plan = plannedFetch,
+           plan.hits > 0,
+           !plan.misses.isEmpty {
+            let plannedBlobs = try model.routedExpertBuffers(for: plan)
+            phase1HitSplitRoutedBufs = plannedBlobs.map { $0.buffer }
+            phase1HitSplitArgBuf = moe.makeRoutedArgumentBuffer(
+                routedBlobs: phase1HitSplitRoutedBufs,
+                topK: topK)
+            if let argBuf = phase1HitSplitArgBuf, plan.hits > 0, !plan.misses.isEmpty {
+                writeActiveSlots(phase1HitSlots, into: moeHitActiveSlots)
+                let cb = ctx.queue.makeCommandBuffer()!
+                encodeRoutedPhase1Subset(
+                    cb,
+                    argBuf: argBuf,
+                    routedBufs: phase1HitSplitRoutedBufs,
+                    activeSlots: moeHitActiveSlots,
+                    activeSlotIndices: phase1HitSlots,
+                    activeCount: UInt32(phase1HitSlots.count))
+                phase1HitCB = cb
+            }
+        }
+
+        // The shared dense MLP depends only on denseX, not on the routed
+        // experts. Commit it without waiting so its GPU work overlaps the
+        // routed-expert pread. The routed CB follows it on the same queue,
+        // so the combine sees h1Buf.
+        let gSharedFFN: (MTLCommandBuffer) -> Void = { [self] cb in
+            try! shared.encode(
+                commandBuffer: cb,
+                x: denseX,
+                gate: sharedProj.gate,
+                up: sharedProj.up,
+                down: sharedProj.down,
+                y: h1Buf,
+                scratchGate: denseScratchGate,
+                scratchUp: denseScratchUp,
+                scratchAct: denseScratchAct)
+        }
+        let gSharedNorm: (MTLCommandBuffer) -> Void = { [self] cb in
+            rms.encodeBF16W(
+                commandBuffer: cb, x: h1Buf,
+                weight: sharedProj.postF1.buffer,
+                weightOffset: Int(sharedProj.postF1.offset),
+                out: h1Buf, d: D, eps: eps)
+        }
+        let sharedCB = ctx.queue.makeCommandBuffer()!
+        gSharedFFN(sharedCB)
+        gSharedNorm(sharedCB)
+        sharedCB.commit()
+        if let cb = phase1HitCB {
+            cb.commit()
+        }
+        if rdadviseEnabled && rdadvisePolicyMode != .off {
+            let requestedMisses = plannedFetch?.misses.count ?? experts.count
+            let estimatedAdviceBytes = try model.routedExpertAdviceByteEstimate(
+                layer: L,
+                missCount: requestedMisses)
+            if let skipped = shouldSkipRDAdvice(
+                position: position,
+                requestedMisses: requestedMisses,
+                estimatedBytes: estimatedAdviceBytes,
+                canOverlapUsefulGPUWork: true) {
+                recordRDAdvice(skipped, wallNanos: 0)
+            } else {
+                let tAdvice = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                let result: ExpertIOAdviceResult
+                if let plannedFetch {
+                    result = try model.adviseRoutedExperts(plan: plannedFetch)
+                } else {
+                    result = try model.adviseRoutedExperts(layer: L, experts: experts)
+                }
+                let wallNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tAdvice
+                recordRDAdvice(result, wallNanos: wallNanos)
+                updateRDAdvicePolicy(after: result, position: position)
+            }
+        }
+
+        // Routed-expert pread — overlaps the shared MLP GPU work above.
+        let tIoStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let blobs: [TensorView]
+        if let plannedFetch {
+            blobs = try await model.fetchRoutedExperts(plan: plannedFetch)
+        } else {
+            blobs = try await model.fetchRoutedExperts(layer: L, experts: experts)
+        }
+        let layerIo = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tIoStart
+        totalIoNanos &+= layerIo
+        let routedBufs = blobs.map { $0.buffer }
+        let tCb2Start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let scalarPtr = layerScalarView.buffer.contents()
+            .advanced(by: Int(layerScalarView.offset))
+            .assumingMemoryBound(to: UInt16.self)
+        let layerScalar = Quantization.bf16ToFloat(scalarPtr[0])
+
+        let gTail: (MTLCommandBuffer) -> Void = { [self] cb in
+            fusedTail.encode(
+                commandBuffer: cb,
+                h2: h2Buf,
+                h1: h1Buf,
+                hidden: hidden,
+                postFFN2Weight: postF2.buffer,
+                postFFN2WeightOffset: Int(postF2.offset),
+                postFFNWeight: postF.buffer,
+                postFFNWeightOffset: Int(postF.offset),
+                d: D,
+                eps: eps,
+                layerScalar: layerScalar)
+        }
+        let routedCB = ctx.queue.makeCommandBuffer()!
+        let splitArgBuf = phase1HitCB != nil && !phase1MissSlots.isEmpty
+            ? phase1HitSplitArgBuf
+            : nil
+        let argBuf = splitArgBuf ?? moe.makeReusedRoutedArgumentBuffer(
+            routedBlobs: routedBufs,
+            topK: topK)
+        if splitArgBuf != nil {
+            writeActiveSlots(phase1MissSlots, into: moeMissActiveSlots)
+            encodeRoutedPhase1Subset(
+                routedCB,
+                argBuf: argBuf,
+                routedBufs: routedBufs,
+                activeSlots: moeMissActiveSlots,
+                activeSlotIndices: phase1MissSlots,
+                activeCount: UInt32(phase1MissSlots.count))
+        } else {
+            encodeRoutedPhase1Full(
+                routedCB,
+                argBuf: argBuf,
+                routedBufs: routedBufs)
+        }
+        moe.encodeRoutedPersistentPhase2Reduce(
+            commandBuffer: routedCB,
+            routedArgBuffer: argBuf,
+            routedBlobs: routedBufs,
+            routedOffsets: routedOffsets,
+            acts: moeActs,
+            routingWeights: outWeights,
+            residual: zeroResidual,
+            y: h2Buf,
+            d: D,
+            f: FmoE,
+            topK: topK)
+        gTail(routedCB)
+        routedCB.commit()
+        precondition(draining == nil,
+                     "routed command-buffer pipeline drained before queuing the next layer")
+        return PendingRoutedCommand(
+            cb: routedCB,
+            sharedCB: sharedCB,
+            phase1HitCB: phase1HitCB,
+            encodeAndCommitNanos: clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb2Start)
+    }
+
 
     private func runSync(_ body: (MTLCommandBuffer) -> Void) throws {
         let cb = ctx.queue.makeCommandBuffer()!
