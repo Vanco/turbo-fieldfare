@@ -330,7 +330,14 @@ public struct GFTokenizer: @unchecked Sendable {
     private static let turnClose   = "<turn|>"
     private static let bosMark     = "<bos>"
 
-    public func applyChatTemplate(_ messages: [Message]) throws -> String {
+    /// `enableThinking` mirrors the `enable_thinking` context the tool path
+    /// passes to the bundled template: the turn opens for the model and the
+    /// thought channel is left unopened, so the model emits `<|channel>thought`
+    /// itself when it chooses to reason before answering. The default stays off
+    /// because pre-opening and immediately closing the thought channel is what
+    /// pins generation to the visible channel.
+    public func applyChatTemplate(_ messages: [Message],
+                                  enableThinking: Bool = false) throws -> String {
         var s = Self.bosMark
         for (index, message) in messages.enumerated() {
             guard let rawContent = message.content else {
@@ -343,12 +350,13 @@ public struct GFTokenizer: @unchecked Sendable {
             let role = message.role == .assistant ? "model" : message.role.rawValue
             s += Self.turnOpen + role + "\n" + content + Self.turnClose + "\n"
         }
-        s += Self.turnOpen + "model\n<|channel>thought\n<channel|>"
+        s += Self.turnOpen + "model\n" + (enableThinking ? "" : "<|channel>thought\n<channel|>")
         return s
     }
 
     public func encodeToolChat(messages: [Message],
-                               tools: [FunctionDefinition]) throws -> [Int32] {
+                               tools: [FunctionDefinition],
+                               enableThinking: Bool = false) throws -> [Int32] {
         guard tokenizer.hasChatTemplate else {
             throw GFTokenizerError.missingToolTemplate
         }
@@ -390,7 +398,7 @@ public struct GFTokenizer: @unchecked Sendable {
             truncation: false,
             maxLength: nil,
             tools: upstreamTools,
-            additionalContext: ["enable_thinking": false]
+            additionalContext: ["enable_thinking": enableThinking]
         ).map(Int32.init)
     }
 
@@ -499,12 +507,15 @@ public struct GFTokenizer: @unchecked Sendable {
         cachedMessages: [Message],
         assistant: Message,
         incomingMessages: [Message],
-        tools: [FunctionDefinition]
+        tools: [FunctionDefinition],
+        enableThinking: Bool = false
     ) throws -> [Int32] {
         let prefix = try encodeToolChat(
             messages: cachedMessages + [assistant],
-            tools: tools)
-        let full = try encodeToolChat(messages: incomingMessages, tools: tools)
+            tools: tools,
+            enableThinking: enableThinking)
+        let full = try encodeToolChat(
+            messages: incomingMessages, tools: tools, enableThinking: enableThinking)
         let callCount = assistant.toolCalls.count
         let starts = prefix.indices.filter { prefix[$0] == toolCallStartID }
         guard callCount > 0, starts.count >= callCount,

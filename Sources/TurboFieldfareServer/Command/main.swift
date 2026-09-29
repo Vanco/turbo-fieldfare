@@ -57,7 +57,7 @@ do {
         streaming = "mmap"
         slots = count
     }
-    print("TurboFieldfareServer ready at http://127.0.0.1:\(arguments.port) model=\(arguments.modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue) vision=\(backend.visionCapability) vision_residency=\(arguments.visionResidency.rawValue) expert_slots=\(slots) expert_streaming=\(streaming) prefill_chunk=\(arguments.prefillChunkTokens)")
+    print("TurboFieldfareServer ready at http://127.0.0.1:\(arguments.port) model=\(arguments.modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue) vision=\(backend.visionCapability) vision_residency=\(arguments.visionResidency.rawValue) expert_slots=\(slots) expert_streaming=\(streaming) prefill_chunk=\(arguments.prefillChunkTokens) thinking=\(arguments.enableThinking)")
 
     _ = await signals.wait()
     try await server.shutdown()

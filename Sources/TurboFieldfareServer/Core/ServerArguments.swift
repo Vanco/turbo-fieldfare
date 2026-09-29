@@ -16,6 +16,10 @@ public struct ServerArguments: Equatable, Sendable {
     public let rdadvisePolicy: RDAdvicePolicyMode
     public let visionPack: String?
     public let visionResidency: VisionResidencyPolicy
+    /// Whether the model turn may open a thought channel of its own. Off
+    /// renders the generation prompt with the thought channel pre-opened and
+    /// closed, so generation stays in the visible channel.
+    public let enableThinking: Bool
 
     /// Which expert backend to use, independent of how many slots it gets.
     /// The slot count always comes from `expertCacheSlots`.
@@ -53,6 +57,9 @@ public static let usage = """
                                  16.4 MB at 128.
       --rdadvise                 Read-advice policy: off, default, bounded, or adaptive
                                  (default off).
+      --enable-thinking on|off   Let the model open a thought channel before its
+                                 answer (default off). Thought text is returned as
+                                 reasoning_content, never as content.
       --help                     Show this help.
     """
 
@@ -108,6 +115,7 @@ public static let usage = """
         var prefillPolicy = RuntimePrefillPolicy.chunked
         var prefillChunkTokens = 128
         var rdadvisePolicy = RDAdvicePolicyMode.off
+        var enableThinking = false
         var index = 0
         while index < input.count {
             let flag = input[index]
@@ -211,6 +219,13 @@ public static let usage = """
                         "--rdadvise must be off, default, bounded, or adaptive")
                 }
                 rdadvisePolicy = parsed
+            case "--enable-thinking":
+                switch value {
+                case "on": enableThinking = true
+                case "off": enableThinking = false
+                default:
+                    throw ServerArgumentError.invalid("--enable-thinking must be on or off")
+                }
             default:
                 throw ServerArgumentError.invalid("unknown flag: \(flag)")
             }
@@ -234,7 +249,8 @@ public static let usage = """
                                prefillChunkTokens: prefillChunkTokens,
                                rdadvisePolicy: rdadvisePolicy,
                                visionPack: visionPack,
-                               visionResidency: visionResidency)
+                               visionResidency: visionResidency,
+                               enableThinking: enableThinking)
     }
 }
 

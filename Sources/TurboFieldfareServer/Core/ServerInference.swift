@@ -20,20 +20,25 @@ public enum ServerInferenceEvent: Equatable, Sendable {
     /// can separate an I/O bound prefill from a GPU bound one.
     case prefill(Int, Int, ServerPrefillIO)
     case content(String)
+    /// Thought-channel text, only produced when the run enables thinking.
+    case reasoning(String)
     case toolCall(ParsedToolCall)
 }
 
 public struct ServerCompletion: Equatable, Sendable {
     public let content: String
+    public let reasoning: String
     public let toolCalls: [ParsedToolCall]
     public let finishReason: String
     public let usage: OpenAIUsage
 
     public init(content: String,
+                reasoning: String = "",
                 toolCalls: [ParsedToolCall],
                 finishReason: String,
                 usage: OpenAIUsage) {
         self.content = content
+        self.reasoning = reasoning
         self.toolCalls = toolCalls
         self.finishReason = finishReason
         self.usage = usage
@@ -527,6 +532,7 @@ public actor ServerModelSession: ServerInferenceBackend {
     public nonisolated let visionCapability: String
     private let visionRuntime: VisionRuntime?
     private let visionResidencyPolicy: VisionResidencyPolicy
+    private let enableThinking: Bool
 
     /// What the cached KV was actually produced by. Six configuration fields
     /// plus every `TURBO_FIELDFARE_*` variable in the environment: those select
@@ -596,7 +602,8 @@ public actor ServerModelSession: ServerInferenceBackend {
             maximumContext: maxContext,
             kvStorage: PrefillKVStorageMode.fp16.rawValue,
             fp16RingEnabled: runtime.fp16RingEnabled,
-            templateSHA256: templateDigest)
+            templateSHA256: templateDigest,
+            enableThinking: arguments.enableThinking)
         let visionRuntime: VisionRuntime?
         let visionCapability: String
         // An explicit pack path is an operator's statement that the pack is
@@ -649,7 +656,8 @@ public actor ServerModelSession: ServerInferenceBackend {
                                   promptCacheDomain: promptCacheDomain,
                                   visionRuntime: visionRuntime,
                                   visionCapability: visionCapability,
-                                  visionResidencyPolicy: visionResidencyPolicy)
+                                  visionResidencyPolicy: visionResidencyPolicy,
+                                  enableThinking: arguments.enableThinking)
     }
 
     static func hardwareVisionCapability(
@@ -679,7 +687,8 @@ public actor ServerModelSession: ServerInferenceBackend {
                  promptCacheDomain: ServerPromptCacheDomain,
                  visionRuntime: VisionRuntime?,
                  visionCapability: String,
-                 visionResidencyPolicy: VisionResidencyPolicy) {
+                 visionResidencyPolicy: VisionResidencyPolicy,
+                 enableThinking: Bool) {
         self.context = context
         self.model = model
         self.tokenizer = tokenizer
@@ -692,6 +701,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         self.visionRuntime = visionRuntime
         self.visionResidencyPolicy = visionResidencyPolicy
         self.visionCapability = visionCapability
+        self.enableThinking = enableThinking
     }
 
     public func generate(
@@ -994,13 +1004,18 @@ public actor ServerModelSession: ServerInferenceBackend {
             maxContext - effectivePromptIDs.count)
         config.stopStrings = []
 
-        let decoder = needsToolTemplate
+        // A thinking-enabled run needs the decoder even without tools: the
+        // model opens `<|channel>thought` itself, and without the decoder that
+        // reasoning would be returned as ordinary content.
+        let decoder = needsToolTemplate || enableThinking
             ? StructuredAssistantDecoder(
                 tokenizer: tokenizer,
-                allowedTools: Set(request.tools.map(\.name)))
+                allowedTools: Set(request.tools.map(\.name)),
+                surfacesReasoning: enableThinking)
             : nil
         var stopMatcher = StreamingStopMatcher(stops: request.generationConfig.stopStrings)
         var content = ""
+        var reasoning = ""
         var calls: [ParsedToolCall] = []
         var decodingError: Error?
         var shouldStop = false
@@ -1035,6 +1050,9 @@ public actor ServerModelSession: ServerInferenceBackend {
                                     onEvent(.content(visible))
                                 }
                                 if stopMatcher.isStopped { shouldStop = true }
+                            case .reasoning(let text):
+                                reasoning += text
+                                onEvent(.reasoning(text))
                             case .toolCall(let call):
                                 calls.append(call)
                                 onEvent(.toolCall(call))
@@ -1136,6 +1154,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         completed = true
         return ServerCompletion(
             content: content,
+            reasoning: reasoning,
             toolCalls: calls,
             finishReason: reason,
             usage: OpenAIUsage(promptTokens: result.prefillTokens,
@@ -1149,9 +1168,11 @@ public actor ServerModelSession: ServerInferenceBackend {
         if usesToolTemplate(request) {
             promptIDs = try tokenizer.encodeToolChat(
                 messages: request.messages,
-                tools: request.tools)
+                tools: request.tools,
+                enableThinking: enableThinking)
         } else {
-            let rendered = try tokenizer.applyChatTemplate(request.messages)
+            let rendered = try tokenizer.applyChatTemplate(
+                request.messages, enableThinking: enableThinking)
             promptIDs = tokenizer.encode(rendered, addBOS: false)
         }
         guard promptIDs.count < maxContext else {

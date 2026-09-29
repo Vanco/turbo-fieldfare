@@ -25,6 +25,18 @@ struct ChatTemplateTests {
         #expect(p.components(separatedBy: "Hi").count - 1 == 1)
     }
 
+    @Test("Thinking-enabled generation prompt leaves the thought channel unopened")
+    func thinkingEnabledLeavesChannelOpen() throws {
+        let off = try tok.applyChatTemplate([Message(role: .user, content: "Hi")])
+        let on = try tok.applyChatTemplate([Message(role: .user, content: "Hi")],
+                                            enableThinking: true)
+        #expect(on.hasSuffix("<|turn>model\n"))
+        // Same history, different generation prompt: the difference is exactly
+        // the pre-opened thought channel.
+        #expect(off == on + "<|channel>thought\n<channel|>")
+        #expect(off != on)
+    }
+
     @Test("Multi-turn closes prior turns and leaves assistant open")
     func multiTurn() throws {
         let p = try tok.applyChatTemplate([

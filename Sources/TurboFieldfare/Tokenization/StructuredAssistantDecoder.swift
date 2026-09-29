@@ -2,6 +2,7 @@ import Foundation
 
 public enum StructuredAssistantEvent: Equatable, Sendable {
     case content(String)
+    case reasoning(String)
     case toolCall(ParsedToolCall)
 }
 
@@ -15,6 +16,10 @@ public final class StructuredAssistantDecoder: @unchecked Sendable {
     private let tokenizer: GFTokenizer
     private let allowedTools: Set<String>
     private let idGenerator: @Sendable () -> String
+    /// Whether thought-channel text is reported as reasoning instead of
+    /// dropped. Off by default so a thinking-disabled run keeps returning
+    /// exactly the content it did before reasoning was observable.
+    private let surfacesReasoning: Bool
     private var channel: Channel = .visible
     private var label = ""
     private var toolTokens: [Int32]?
@@ -23,11 +28,13 @@ public final class StructuredAssistantDecoder: @unchecked Sendable {
 
     public init(tokenizer: GFTokenizer,
                 allowedTools: Set<String>,
+                surfacesReasoning: Bool = false,
                 idGenerator: @escaping @Sendable () -> String = {
                     "call_" + (0..<24).map { _ in String(format: "%x", UInt8.random(in: 0...15)) }.joined()
                 }) {
         self.tokenizer = tokenizer
         self.allowedTools = allowedTools
+        self.surfacesReasoning = surfacesReasoning
         self.idGenerator = idGenerator
     }
 
@@ -117,7 +124,7 @@ public final class StructuredAssistantDecoder: @unchecked Sendable {
     private func routeText(_ delta: String) -> [StructuredAssistantEvent] {
         switch channel {
         case .thought:
-            return []
+            return surfacesReasoning && !delta.isEmpty ? [.reasoning(delta)] : []
         case .visible:
             return delta.isEmpty ? [] : [.content(delta)]
         case .label:
@@ -131,7 +138,7 @@ public final class StructuredAssistantDecoder: @unchecked Sendable {
             if channel == .visible, !content.isEmpty {
                 return [.content(content)]
             }
-            return []
+            return surfacesReasoning && !content.isEmpty ? [.reasoning(content)] : []
         }
     }
 

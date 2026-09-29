@@ -14,6 +14,10 @@ struct ServerPromptCacheDomain: Sendable, Equatable {
     let kvStorage: String
     let fp16RingEnabled: Bool
     let templateSHA256: String
+    /// Part of the domain, not a rendering hint: the two modes produce
+    /// different prompt tokens for the same messages, so an entry built by one
+    /// can never be resumed by the other.
+    let enableThinking: Bool
 }
 
 struct CachedAssistantTurn: Sendable, Equatable {
@@ -282,7 +286,8 @@ struct ServerPromptCache: Sendable {
                 cachedMessages: entry.inputMessages,
                 assistant: entry.assistantTurn.message,
                 incomingMessages: request.messages,
-                tools: request.tools)
+                tools: request.tools,
+                enableThinking: entry.domain.enableThinking)
         } catch {
             ServerLog.promptCacheBridgeFailed(error: error)
             return .miss(.bridgeRenderFailed)

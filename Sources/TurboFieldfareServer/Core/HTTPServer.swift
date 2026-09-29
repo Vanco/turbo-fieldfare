@@ -416,6 +416,12 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                                         self.chunk(id: responseID, created: created,
                                                    delta: ["content": text],
                                                    finishReason: nil))
+                                case .reasoning(let text):
+                                    self.writeStreamChunk(
+                                        contextBox.value,
+                                        self.chunk(id: responseID, created: created,
+                                                   delta: ["reasoning_content": text],
+                                                   finishReason: nil))
                                 case .toolCall(let call):
                                     self.writeToolCall(contextBox.value,
                                                        id: responseID,
@@ -479,6 +485,9 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
         ]
         if !completion.toolCalls.isEmpty {
             message["tool_calls"] = completion.toolCalls.map(toolCallObject)
+        }
+        if !completion.reasoning.isEmpty {
+            message["reasoning_content"] = completion.reasoning
         }
         let object: [String: Any] = [
             "id": id,

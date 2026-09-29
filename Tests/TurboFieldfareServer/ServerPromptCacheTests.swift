@@ -13,7 +13,8 @@ struct ServerPromptCacheTests {
         maximumContext: 16_384,
         kvStorage: "fp16",
         fp16RingEnabled: true,
-        templateSHA256: "template")
+        templateSHA256: "template",
+        enableThinking: false)
 
     @Test func textContinuationUsesActualGeneratedHistoryAndOnlyPrefillsSuffix() async throws {
         let tokenizer = try await GFTokenizer.load()

@@ -816,6 +816,43 @@ struct GemmaToolCallTests {
         ])
     }
 
+    @Test func surfacesThoughtTextAsReasoningWhenThinkingIsEnabled() async throws {
+        let tokenizer = try await GFTokenizer.load()
+        let decoder = StructuredAssistantDecoder(
+            tokenizer: tokenizer, allowedTools: [], surfacesReasoning: true)
+        #expect(try decoder.consume(tokenID: tokenizer.channelStartID, delta: "").isEmpty)
+        #expect(try decoder.consume(tokenID: tokenizer.bosID, delta: "thought\n").isEmpty)
+        #expect(try decoder.consume(tokenID: tokenizer.bosID, delta: "weighing") == [
+            .reasoning("weighing"),
+        ])
+        // Closing the thought channel re-opens the visible one; it must not
+        // re-emit the reasoning that was already reported.
+        #expect(try decoder.consume(tokenID: tokenizer.channelEndID, delta: "").isEmpty)
+        #expect(try decoder.consume(tokenID: tokenizer.channelStartID, delta: "").isEmpty)
+        #expect(try decoder.consume(tokenID: tokenizer.bosID, delta: "final\nanswer") == [
+            .content("answer"),
+        ])
+    }
+
+    @Test func reasoningStaysOutOfContentAndContentStaysOutOfReasoning() async throws {
+        // The point of the flag is that reasoning is reported as reasoning, so
+        // a thinking-enabled run cannot leak a plan into the assistant message.
+        // Text riding the channel label resolves its channel from that label, so
+        // both directions have to be checked.
+        let tokenizer = try await GFTokenizer.load()
+        let decoder = StructuredAssistantDecoder(
+            tokenizer: tokenizer, allowedTools: [], surfacesReasoning: true)
+        _ = try decoder.consume(tokenID: tokenizer.channelStartID, delta: "")
+        let plan = try decoder.consume(tokenID: tokenizer.bosID, delta: "thought\nreason")
+        #expect(plan == [.reasoning("reason")])
+        let answer = try decoder.consume(tokenID: tokenizer.bosID, delta: " more")
+        #expect(answer == [.reasoning(" more")])
+        _ = try decoder.consume(tokenID: tokenizer.channelEndID, delta: "")
+        _ = try decoder.consume(tokenID: tokenizer.channelStartID, delta: "")
+        let visible = try decoder.consume(tokenID: tokenizer.bosID, delta: "final\nreply")
+        #expect(visible == [.content("reply")])
+    }
+
     @Test func routesControlTokenDeltaThroughCurrentChannel() async throws {
         // A non-empty delta on a control token is text the detokenizer held
         // back from before that token; it belongs to the channel in effect
@@ -923,6 +960,22 @@ struct ServerArgumentTests {
         #expect(arguments.prefillPolicy == .chunked)
         #expect(arguments.prefillChunkTokens == 128)
         #expect(arguments.rdadvisePolicy == .off)
+        #expect(arguments.enableThinking == false)
+    }
+
+    @Test func parsesEnableThinking() throws {
+        #expect(try ServerArguments.parse(["--model", "m.gturbo"]).enableThinking == false)
+        #expect(try ServerArguments.parse(
+            ["--model", "m.gturbo", "--enable-thinking", "on"]).enableThinking == true)
+        // Last flag wins, matching the other on|off pairs here.
+        #expect(try ServerArguments.parse([
+            "--model", "m.gturbo",
+            "--enable-thinking", "on",
+            "--enable-thinking", "off",
+        ]).enableThinking == false)
+        #expect(throws: ServerArgumentError.self) {
+            try ServerArguments.parse(["--model", "m.gturbo", "--enable-thinking", "maybe"])
+        }
     }
 
     /// The server rejected `--prefill-chunk-tokens auto` while the CLI accepted
@@ -1144,7 +1197,8 @@ struct ServerArgumentTests {
                                         prefillChunkTokens: 128,
                                         rdadvisePolicy: .off,
                                         visionPack: nil,
-                                        visionResidency: .onDemand),
+                                        visionResidency: .onDemand,
+                                        enableThinking: false),
              allowed: RuntimeConfiguration.allowedExpertCacheSlots,
              namesAuto: false),
             (flag: "--prefill-chunk-tokens",
@@ -1161,7 +1215,8 @@ struct ServerArgumentTests {
                                         prefillChunkTokens: 512,
                                         rdadvisePolicy: .off,
                                         visionPack: nil,
-                                        visionResidency: .onDemand),
+                                        visionResidency: .onDemand,
+                                        enableThinking: false),
              allowed: RuntimeConfiguration.allowedPrefillChunkTokens,
              namesAuto: true),
         ]
