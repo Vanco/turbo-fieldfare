@@ -437,16 +437,30 @@ references lead to the supporting code and tests.
 
 ## Scope and limitations
 
-The current runtime supports text and image input with the pinned Gemma 4
-26B-A4B instruction checkpoint. Image support is optional. The vision tower
-and projector live in a separate companion pack, so an installation without
-that pack has the footprint it had before. The image tower requires M2 or
-newer; text-only inference remains available on M1. See [Images](#images).
+The runtime supports text generation from two pinned instruction checkpoints,
+Gemma 4 26B-A4B and Qwen 3.6 35B-A3B. Qwen 3.6 is selected from
+`manifest.json -> arch.family`.
+
+Image input is supported for Gemma 4 only, and only through the optional
+companion pack. The vision tower and projector live in that separate pack, so an
+installation without it has the footprint it had before. The image tower
+requires M2 or newer; text-only inference remains available on M1. See
+[Images](#images).
+
+Qwen 3.6 is a hybrid of 30 gated-DeltaNet linear-attention layers and 10 gated
+full-attention layers, with 256 routed experts per layer and a gated shared
+expert. It holds the same bounded-memory contract as Gemma 4 and in fact uses
+less: a measured 1,448 MiB peak process footprint at 4K context against Gemma's
+~2,126 MiB, because its experts are half the size and only a quarter of its
+layers keep a KV cache. That was verified with the working set constrained to
+about 8 GB. Its install needs about 19.6 GB of disk against Gemma's 14.3 GB.
+See [Qwen 3.6 performance notes](QWEN36_PERFORMANCE.md) and
+[Benchmarks](BENCHMARKS.md#qwen-36-35b-a3b-measured-decode).
 
 The Mac app offers 4K, 8K, 16K, 32K, and 64K context lengths. Manual acceptance
-covers the Mac app at 8K and CLI stress at 64K. Audio input, video input,
-training, fine-tuning, server batching, remote serving, and general model
-support are outside the current scope. The optional HTTP server is loopback-only, owns one
+covers the Mac app at 8K, CLI stress at 64K, and Qwen 3.6 at 4K. Audio input,
+video input, training, fine-tuning, server batching, remote serving, and
+general model support are outside the current scope.
 warm model, serializes generation, and retains one verified conversational KV
 prefix by default. It retains only that prefix. See the
 [local server guide](OPENAI_SERVER.md).

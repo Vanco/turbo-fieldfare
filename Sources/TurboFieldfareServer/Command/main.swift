@@ -38,10 +38,14 @@ do {
         promptCacheMode: arguments.promptCacheMode,
         runtimeConfiguration: runtimeConfiguration,
         arguments: arguments)
+    // The family-derived default is what makes an installed Qwen model answer
+    // as `qwen3.6-35b-a3b`; the override keeps `--model-id` authoritative.
+    let modelID = arguments.modelIDOverride ?? backend.defaultModelID
     let server = TurboFieldfareHTTPServer(
-        modelID: arguments.modelID,
+        modelID: modelID,
         queueLimit: arguments.queueLimit,
         backend: backend,
+        chatDialect: backend.chatDialect,
         visionCapability: backend.visionCapability)
     _ = try await server.start(port: arguments.port)
     // The slot count and prefill chunk size are the two knobs that decide
@@ -57,7 +61,7 @@ do {
         streaming = "mmap"
         slots = count
     }
-    print("TurboFieldfareServer ready at http://127.0.0.1:\(arguments.port) model=\(arguments.modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue) vision=\(backend.visionCapability) vision_residency=\(arguments.visionResidency.rawValue) expert_slots=\(slots) expert_streaming=\(streaming) prefill_chunk=\(arguments.prefillChunkTokens) thinking=\(arguments.enableThinking)")
+    print("TurboFieldfareServer ready on http://0.0.0.0:\(arguments.port) (reach it as http://<this-mac-lan-ip>:\(arguments.port); no auth, no TLS) model=\(modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue) vision=\(backend.visionCapability) vision_residency=\(arguments.visionResidency.rawValue) expert_slots=\(slots) expert_streaming=\(streaming) prefill_chunk=\(arguments.prefillChunkTokens) thinking=\(arguments.enableThinking) dialect=\(backend.chatDialect.rawValue)")
 
     _ = await signals.wait()
     try await server.shutdown()

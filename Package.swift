@@ -139,8 +139,8 @@ let package = Package(
                 .product(name: "Hub", package: "swift-transformers"),
             ],
             path: "Tests/TurboFieldfare/Core",
-            resources: [.copy("Runtime/Vision/Fixtures/images")]
-        ),
+            resources: [.copy("Runtime/Vision/Fixtures/images"),
+                         .copy("Tokenization/Fixtures")]        ),
         .testTarget(
             name: "TurboFieldfareRepackTests",
             dependencies: ["TurboFieldfareFormat", "TurboFieldfareRepackCore"],

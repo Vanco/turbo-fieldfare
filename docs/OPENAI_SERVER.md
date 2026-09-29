@@ -1,8 +1,10 @@
 # Local OpenAI-compatible server
 
-`TurboFieldfareServer` exposes a local Chat Completions API for one Gemma
-model. It binds to `127.0.0.1` without authentication or TLS. Do not expose it
-through a proxy or tunnel.
+`TurboFieldfareServer` exposes a Chat Completions API for one installed model.
+It binds to `0.0.0.0` without authentication or TLS, so another Mac on the same
+network can reach it at `http://<this-mac-lan-ip>:<port>/v1`. Anything that can
+route to the port can drive the model and read or write its files, so run it
+only on a network you trust. Do not expose it to the public internet.
 
 ## Start the server
 

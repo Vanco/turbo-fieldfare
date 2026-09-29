@@ -17,6 +17,7 @@ public actor TurboFieldfareHTTPServer {
 
     private let group: MultiThreadedEventLoopGroup
     private let modelID: String
+    private let chatDialect: ChatDialect
     private let backend: any ServerInferenceBackend
     private let coordinator: ServerCoordinator
     private let heartbeatInterval: TimeAmount
@@ -30,6 +31,7 @@ public actor TurboFieldfareHTTPServer {
     public init(modelID: String,
                 queueLimit: Int,
                 backend: any ServerInferenceBackend,
+                chatDialect: ChatDialect = .gemma,
                 heartbeatInterval: TimeAmount = .seconds(5),
                 visionCapability: String = "missing",
                 attachmentRoot: URL = ServerAttachmentDirectory.root,
@@ -37,6 +39,7 @@ public actor TurboFieldfareHTTPServer {
                 group: MultiThreadedEventLoopGroup = .init(numberOfThreads: 1)) {
         self.group = group
         self.modelID = modelID
+        self.chatDialect = chatDialect
         self.backend = backend
         self.coordinator = ServerCoordinator(queueLimit: queueLimit)
         self.heartbeatInterval = heartbeatInterval
@@ -48,6 +51,7 @@ public actor TurboFieldfareHTTPServer {
 
     public func start(port: Int) async throws -> Channel {
         let modelID = self.modelID
+        let chatDialect = self.chatDialect
         let backend = self.backend
         let coordinator = self.coordinator
         let heartbeatInterval = self.heartbeatInterval
@@ -74,6 +78,7 @@ public actor TurboFieldfareHTTPServer {
                 }.flatMap {
                     channel.pipeline.addHandler(ServerHTTPHandler(
                         modelID: modelID,
+                        chatDialect: chatDialect,
                         backend: backend,
                         coordinator: coordinator,
                         heartbeatInterval: heartbeatInterval,
@@ -83,7 +88,11 @@ public actor TurboFieldfareHTTPServer {
                 }
             }
             .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-        let channel = try await bootstrap.bind(host: "127.0.0.1", port: port).get()
+        // Binds all interfaces so a second Mac on the same LAN can reach this
+        // OpenAI-compatible endpoint. There is no remote authentication and no
+        // TLS, so anything that can route to this port can drive the model:
+        // run it only on a network you trust.
+        let channel = try await bootstrap.bind(host: "0.0.0.0", port: port).get()
         self.channel = channel
         return channel
     }
@@ -144,6 +153,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     typealias OutboundOut = HTTPServerResponsePart
 
     private let modelID: String
+    private let chatDialect: ChatDialect
     private let backend: any ServerInferenceBackend
     private let coordinator: ServerCoordinator
     private let heartbeatInterval: TimeAmount
@@ -164,6 +174,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
     private var activeTask: Task<Void, Never>?
 
     init(modelID: String,
+         chatDialect: ChatDialect = .gemma,
          backend: any ServerInferenceBackend,
          coordinator: ServerCoordinator,
          heartbeatInterval: TimeAmount,
@@ -171,6 +182,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
          attachmentRoot: URL,
          childChannels: ChildChannelRegistry) {
         self.modelID = modelID
+        self.chatDialect = chatDialect
         self.backend = backend
         self.coordinator = coordinator
         self.heartbeatInterval = heartbeatInterval
@@ -338,6 +350,7 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             let request = try OpenAIRequestValidator.validate(
                 decoded,
                 modelID: modelID,
+                dialect: chatDialect,
                 preStagedImages: body.stagedImages,
                 attachmentLease: body.lease)
             let responseID = "chatcmpl-" + UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "")

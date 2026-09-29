@@ -11,16 +11,19 @@ import Tokenizers
 /// 1. The Gemma decoder sequence (`Replace`, `ByteFallback`, `Fuse`) is
 ///    position-independent, so the decode of a token stream is the
 ///    concatenation of its per-token fragments. `GemmaDecoding` reproduces that
-///    sequence without HF's `clean_up_tokenization_spaces` pass, which is the
-///    one stage that rewrites already-decoded text and is wrong for this
-///    tokenizer anyway (see `GemmaDecoding`).
-/// 2. BPE byte fallback splits a multi-byte codepoint across several tokens, so
-///    a run of `<0xXX>` tokens is held until the token that closes it and
-///    commits as a whole, with the reference decoder's semantics (see
-///    `ByteFallbackRun`). Skipped special tokens are filtered before the run
-///    logic — matching the library, which drops special IDs before its decoder
-///    chain — so a run fuses across them; in keep mode a special is an ordinary
-///    token and closes the run.
+///    sequence without HF's `clean_up_tokenization_spaces` pass, which is
+///    the one stage that rewrites already-decoded text and is wrong for this
+///    tokenizer anyway (see `GemmaDecoding`). ChatML/Qwen declare a byte-level
+///    decoder instead, which `ByteLevelDecoding` reproduces; the two alphabets
+///    are disjoint, so the dialect selects one and no token is ambiguous.
+/// 2. BPE splits a multi-byte codepoint across several tokens — as `<0xXX>`
+///    byte-fallback runs for Gemma, as raw byte runs for ChatML — so a run is
+///    held until the token that closes it and commits as a whole, with the
+///    reference decoder's semantics (see `ByteFallbackRun`, `ByteLevelRun`).
+///    Skipped special tokens are filtered before the run logic — matching the
+///    library, which drops special IDs before its decoder chain — so a run fuses
+///    across them; in keep mode a special is an ordinary token and closes the
+///    run.
 ///
 /// `barrierTokenIDs` carves out an exception to the fuse rule for the
 /// generation pipeline: the channel/tool markers structure assistant output,
@@ -41,8 +44,14 @@ struct GFDetokenizer {
     let skipSpecialTokens: Bool
     private let specialTokenIDs: Set<Int32>
     private let barrierTokenIDs: Set<Int32>
-    /// In-flight byte-fallback run.
+    /// ChatML/Qwen declare a byte-level decoder, Gemma a metaspace +
+    /// byte-fallback one. The two alphabets are disjoint, so the dialect picks
+    /// the path and no token is ambiguous.
+    private let dialect: ChatDialect
+    /// In-flight byte-fallback (Gemma) run.
     private var run = ByteFallbackRun()
+    /// In-flight byte-level (ChatML) run.
+    private var byteRun = ByteLevelRun()
 
     init(tokenizer: GFTokenizer,
          skipSpecialTokens: Bool = true,
@@ -51,26 +60,44 @@ struct GFDetokenizer {
         self.skipSpecialTokens = skipSpecialTokens
         self.specialTokenIDs = tokenizer.specialTokenIDs
         self.barrierTokenIDs = barrierTokenIDs
+        self.dialect = tokenizer.dialect
     }
 
     /// Text contributed by `id`, ready to append to the stream.
     ///
-    /// Returns `""` while a byte-fallback run is still open and valid; those
-    /// bytes come out with the token that closes the run, at a barrier marker,
-    /// or at `flush()`.
+    /// Returns `""` while a run is still open and valid; those bytes come out
+    /// with the token that closes the run, at a barrier marker, or at
+    /// `flush()`.
     mutating func push(_ id: Int32) -> String {
         // An unknown ID contributes nothing and leaves the run open, matching
         // the library, whose decode compactMap-drops unresolvable IDs.
         guard let token = tokenizer.convertIdToToken(Int(id)) else { return "" }
         if skipSpecialTokens, specialTokenIDs.contains(id) {
-            return barrierTokenIDs.contains(id) ? run.commit() : ""
+            return barrierTokenIDs.contains(id) ? commit() : ""
         }
-        if let byte = GemmaDecoding.byteValue(token) { return run.push(byte) }
-        return run.commit() + GemmaDecoding.fragment(token)
+        switch dialect {
+        case .gemma:
+            if let byte = GemmaDecoding.byteValue(token) { return run.push(byte) }
+            return run.commit() + GemmaDecoding.fragment(token)
+        case .chatml:
+            // A character outside the byte alphabet means an added special
+            // token, which is literal text rather than a byte run.
+            guard let bytes = ByteLevelDecoding.bytes(for: token) else {
+                return commit() + token
+            }
+            return commit() + byteRun.push(bytes)
+        }
     }
 
     /// Remainder held back at a stop boundary.
     mutating func flush() -> String {
-        run.commit()
+        commit()
+    }
+
+    private mutating func commit() -> String {
+        switch dialect {
+        case .gemma: return run.commit()
+        case .chatml: return byteRun.commit()
+        }
     }
 }

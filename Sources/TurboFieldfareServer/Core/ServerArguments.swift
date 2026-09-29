@@ -4,7 +4,10 @@ import TurboFieldfare
 public struct ServerArguments: Equatable, Sendable {
     public let model: String
     public let port: Int
-    public let modelID: String
+    /// Explicit --model-id value; nil defers to the loaded model's family
+    /// default (gemma-4-26b-a4b-it or qwen3.6-35b-a3b).
+    public let modelIDOverride: String?
+    public var modelID: String { modelIDOverride ?? "gemma-4-26b-a4b-it" }
     public let maxContext: Int
     public let queueLimit: Int
     public let promptCacheMode: ServerPromptCacheMode
@@ -36,7 +39,9 @@ public static let usage = """
       --vision-residency <on-demand|keep-ready>
                                  Routed-expert residency during vision (default on-demand).
       --port <1...65535>         Loopback port (default 8080).
-      --model-id <id>            API model identifier (default gemma-4-26b-a4b-it).
+      --model-id <id>            API model identifier (default derived from the
+                                 installed model: gemma-4-26b-a4b-it or
+                                 qwen3.6-35b-a3b).
       --max-context <tokens>     4096, 8192, 16384, 32768, or 65536 (default 16384).
       --queue-limit <count>      Maximum queued requests (default 4).
       --prompt-cache-mode <off|single-prefix>
@@ -99,7 +104,7 @@ public static let usage = """
     public static func parse(_ input: [String]) throws -> ServerArguments {
         var model: String?
         var port = 8080
-        var modelID = "gemma-4-26b-a4b-it"
+        var modelIDOverride: String?
         var maxContext = 16_384
         var queueLimit = 4
         var promptCacheMode: ServerPromptCacheMode = .singlePrefix
@@ -137,7 +142,7 @@ public static let usage = """
                 guard !value.isEmpty else {
                     throw ServerArgumentError.invalid("--model-id must not be empty")
                 }
-                modelID = value
+                modelIDOverride = value
             case "--max-context":
                 guard let parsed = Int(value),
                       [4_096, 8_192, 16_384, 32_768, 65_536].contains(parsed) else {
@@ -238,7 +243,7 @@ public static let usage = """
         }
         return ServerArguments(model: model,
                                port: port,
-                               modelID: modelID,
+                               modelIDOverride: modelIDOverride,
                                maxContext: maxContext,
                                queueLimit: queueLimit,
                                promptCacheMode: promptCacheMode,

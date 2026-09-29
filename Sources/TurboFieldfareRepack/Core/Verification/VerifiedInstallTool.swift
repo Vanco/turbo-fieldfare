@@ -20,7 +20,9 @@ public struct VerifyInstallResult: Sendable {
 public enum VerifiedInstallTool {
     public static let metadataMaxBytes: UInt64 = 16 * 1024 * 1024
     public static let manifestMaxBytes: UInt64 = 4 * 1024 * 1024
-    public static let layoutMaxBytes: UInt64 = 16 * 1024 * 1024
+    // 64 MiB: Gemma's layout.json is 8.1 MiB, but Qwen 3.6's is 21.5 MiB
+    // (40 layers x 256 experts), which the previous 16 MiB cap rejected.
+    public static let layoutMaxBytes: UInt64 = 64 * 1024 * 1024
 
     public static func run(options: VerifyInstallOptions) throws -> VerifyInstallResult {
         let root = URL(fileURLWithPath: options.inputGTurbo).standardizedFileURL

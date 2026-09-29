@@ -503,16 +503,19 @@ private enum OpenAIToolName {
 
 public enum OpenAIRequestValidator {
     public static func validate(_ request: OpenAIChatRequest,
-                                modelID: String) throws -> ValidatedChatRequest {
+                                modelID: String,
+                                dialect: ChatDialect = .gemma) throws -> ValidatedChatRequest {
         try validate(
             request,
             modelID: modelID,
+            dialect: dialect,
             preStagedImages: [:],
             attachmentLease: nil)
     }
 
     static func validate(_ request: OpenAIChatRequest,
                          modelID: String,
+                         dialect: ChatDialect = .gemma,
                          preStagedImages: [String: ServerStagedImage],
                          attachmentLease: ServerAttachmentLease?) throws -> ValidatedChatRequest {
         guard request.model == modelID else { throw ServerRequestError.unknownModel }
@@ -601,9 +604,12 @@ public enum OpenAIRequestValidator {
                           "tool_choice", "unsupported_value")
         }
 
-        let tools = try (includeTools ? request.tools ?? [] : []).map(validateTool)
+        let tools = try (includeTools ? request.tools ?? [] : []).map {
+            try validateTool($0, dialect: dialect)
+        }
         let validatedMessages = try validateMessages(
             request.messages,
+            dialect: dialect,
             preStagedImages: preStagedImages,
             attachmentLease: attachmentLease)
         let config = GenerationConfig(maxNewTokens: maximum,
@@ -625,7 +631,8 @@ public enum OpenAIRequestValidator {
                                     attachmentLeases: validatedMessages.leases)
     }
 
-    private static func validateTool(_ tool: OpenAITool) throws -> GFTokenizer.FunctionDefinition {
+    private static func validateTool(_ tool: OpenAITool,
+                                     dialect: ChatDialect) throws -> GFTokenizer.FunctionDefinition {
         guard tool.type == "function" else {
             throw invalid("only function tools are supported", "tools", "unsupported_tool")
         }
@@ -638,9 +645,13 @@ public enum OpenAIRequestValidator {
             throw invalid("tool parameters must be an object schema",
                           "tools", "invalid_tool_schema")
         }
-        try validateSchemaKeys(tool.function.parameters)
-        let parameters = try GemmaToolSchema.adapted(
-            tool.function.parameters, toolName: name)
+        try validateSchemaKeys(tool.function.parameters, dialect: dialect)
+        // The Gemma rewrite is a fix for Gemma's own tool-schema quirks, so it
+        // only applies to that dialect. ChatML takes the client's schema as
+        // given, which is what the Qwen branch validated.
+        let parameters = dialect == .chatml
+            ? tool.function.parameters
+            : try GemmaToolSchema.adapted(tool.function.parameters, toolName: name)
         do {
             guard (try? parameters.jinjaSendableValue()) != nil else {
                 throw invalid("tool schema contains a number that cannot be represented exactly",
@@ -658,7 +669,8 @@ public enum OpenAIRequestValidator {
                                               parameters: parameters)
     }
 
-    private static func validateSchemaKeys(_ schema: JSONValue) throws {
+    private static func validateSchemaKeys(_ schema: JSONValue,
+                                           dialect: ChatDialect) throws {
         switch schema {
         case .object(let object):
             for (schemaKey, value) in object {
@@ -668,21 +680,24 @@ public enum OpenAIRequestValidator {
                                       "tools", "invalid_tool_schema")
                     }
                     for (key, definition) in definitions {
-                        guard GemmaToolCallParser.isRepresentableObjectKey(key) else {
+                        // Gemma's tool-call DSL cannot round-trip arbitrary
+                        // parameter names; ChatML tool calls are free-form.
+                        guard dialect == .chatml
+                                || GemmaToolCallParser.isRepresentableObjectKey(key) else {
                             throw invalid(
                                 "tool parameter names may contain only letters, numbers, _, -, ., and $",
                                 "tools",
                                 "invalid_tool_schema")
                         }
-                        try validateSchemaKeys(definition)
+                        try validateSchemaKeys(definition, dialect: dialect)
                     }
                 } else {
-                    try validateSchemaKeys(value)
+                    try validateSchemaKeys(value, dialect: dialect)
                 }
             }
         case .array(let values):
             for value in values {
-                try validateSchemaKeys(value)
+                try validateSchemaKeys(value, dialect: dialect)
             }
         default:
             break
@@ -699,6 +714,7 @@ public enum OpenAIRequestValidator {
 
     private static func validateMessages(
         _ input: [OpenAIChatMessage],
+        dialect: ChatDialect,
         preStagedImages: [String: ServerStagedImage],
         attachmentLease: ServerAttachmentLease?
     ) throws -> ValidatedMessages {
@@ -804,7 +820,8 @@ public enum OpenAIRequestValidator {
                                   "messages", "invalid_tool_arguments")
                 }
                 do {
-                    guard (try? arguments.gemmaToolArgumentBody()) != nil,
+                    guard dialect == .chatml
+                            || (try? arguments.gemmaToolArgumentBody()) != nil,
                           (try? arguments.jinjaSendableValue()) != nil else {
                         throw invalid(
                             "historical tool arguments cannot be represented exactly",

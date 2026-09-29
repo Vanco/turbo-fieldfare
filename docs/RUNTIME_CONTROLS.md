@@ -30,6 +30,12 @@ same names and values. Their defaults agree except for `--max-context`, which
 the server defaults to 16,384 rather than 8,192. The server resolves them before it loads the
 model, so an unsupported combination fails immediately with the usage text.
 
+The CLI applies these settings when it loads the model, so each run uses the
+values passed on its command line. Setting `TURBO_FIELDFARE_PHASES=1` makes the
+CLI print the decode phase split (`cb1`, expert I/O await, `cb2`, and GPU
+waits) after the timing footer; it is a diagnostic and does not change
+behavior.
+
 | Control | Mac values | CLI and server flag | Production default | Effect |
 | --- | --- | --- | --- | --- |
 | Expert-cache slots | 8, 16, 24, 32 | `--expert-cache-slots` | 16 | More slots can retain more routed experts and reduce later reads, but values above 16 use more RAM. Chunked prefill requires at least 16 slots. |

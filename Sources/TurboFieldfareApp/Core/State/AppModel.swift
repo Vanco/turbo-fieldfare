@@ -212,7 +212,8 @@ public final class AppModel {
 
     public init(modelDirectory: URL? = nil,
                 client: any AppInferenceClient = RealInferenceClient(),
-                installer: any AppModelInstallerClient = RepackModelInstallerClient(),
+                installer: any AppModelInstallerClient = RepackModelInstallerClient(
+                    descriptor: .selected),
                 visionInstaller: any AppVisionPackInstallerClient = RepackVisionPackInstallerClient(),
                 memorySampler: AppMemorySampler = AppMemorySampler(),
                 attachmentStore: AppImageAttachmentStore = AppImageAttachmentStore(),

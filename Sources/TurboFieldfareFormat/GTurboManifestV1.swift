@@ -33,6 +33,25 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
     package let hiddenActivation: String
     package let fullAttentionLayerMask: [Int]
 
+    // Family extensions for non-Gemma architectures. Optional and omitted
+    // when nil, so a Gemma manifest stays byte-identical to the pre-family
+    // format; a reader treats absence as the Gemma defaults. `family` is a
+    // plain string rather than a model enum to keep this module
+    // Foundation-only.
+    package let family: String?
+    package let attnOutputGate: Bool?
+    package let attentionScale: Double?
+    package let embeddingScaledBySqrtHidden: Bool?
+    package let routerScaled: Bool?
+    package let ffnSandwichNorms: Bool?
+    package let sharedExpertGated: Bool?
+    package let ropeNeoxSubdim: Bool?
+    package let linearNumKHeads: Int?
+    package let linearNumVHeads: Int?
+    package let linearKeyHeadDim: Int?
+    package let linearValueHeadDim: Int?
+    package let linearConvKernelSize: Int?
+
     package init(hiddenSize: Int, ffnIntermediate: Int, moeIntermediateSize: Int,
                  numHeads: Int, numKVHeads: Int, numFullKVHeads: Int,
                  headDim: Int, fullHeadDim: Int, vocabSize: Int,
@@ -40,7 +59,20 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
                  ropeTheta: Double, fullRopeTheta: Double,
                  partialRotaryFactor: Double, numLayers: Int, numExperts: Int,
                  topKExperts: Int, tieWordEmbeddings: Bool, attentionKEqV: Bool,
-                 hiddenActivation: String, fullAttentionLayerMask: [Int]) {
+                 hiddenActivation: String, fullAttentionLayerMask: [Int],
+                 family: String? = nil,
+                 attnOutputGate: Bool? = nil,
+                 attentionScale: Double? = nil,
+                 embeddingScaledBySqrtHidden: Bool? = nil,
+                 routerScaled: Bool? = nil,
+                 ffnSandwichNorms: Bool? = nil,
+                 sharedExpertGated: Bool? = nil,
+                 ropeNeoxSubdim: Bool? = nil,
+                 linearNumKHeads: Int? = nil,
+                 linearNumVHeads: Int? = nil,
+                 linearKeyHeadDim: Int? = nil,
+                 linearValueHeadDim: Int? = nil,
+                 linearConvKernelSize: Int? = nil) {
         self.hiddenSize = hiddenSize
         self.ffnIntermediate = ffnIntermediate
         self.moeIntermediateSize = moeIntermediateSize
@@ -62,6 +94,19 @@ package struct GTurboManifestArchV1: Codable, Equatable, Sendable {
         self.attentionKEqV = attentionKEqV
         self.hiddenActivation = hiddenActivation
         self.fullAttentionLayerMask = fullAttentionLayerMask
+        self.family = family
+        self.attnOutputGate = attnOutputGate
+        self.attentionScale = attentionScale
+        self.embeddingScaledBySqrtHidden = embeddingScaledBySqrtHidden
+        self.routerScaled = routerScaled
+        self.ffnSandwichNorms = ffnSandwichNorms
+        self.sharedExpertGated = sharedExpertGated
+        self.ropeNeoxSubdim = ropeNeoxSubdim
+        self.linearNumKHeads = linearNumKHeads
+        self.linearNumVHeads = linearNumVHeads
+        self.linearKeyHeadDim = linearKeyHeadDim
+        self.linearValueHeadDim = linearValueHeadDim
+        self.linearConvKernelSize = linearConvKernelSize
     }
 }
 
@@ -192,11 +237,15 @@ package enum GTurboManifestCodec {
                 field: "manifest.arch", reason: "dimensions disagree with streaming metadata")
         }
         let arch = manifest.arch
+        // `slidingWindow` 0 means "no windowed layers": Qwen 3.6 alternates
+        // linear and *global* attention, so it has no sliding window at all.
+        // The prefill kernel reads 0 as "skip the window clamp", so 0 is a
+        // real configuration rather than a missing value.
         guard arch.hiddenSize > 0, arch.ffnIntermediate > 0,
               arch.moeIntermediateSize > 0, arch.numHeads > 0,
               arch.numKVHeads > 0, arch.numFullKVHeads > 0,
               arch.headDim > 0, arch.fullHeadDim > 0,
-              arch.vocabSize > 0, arch.slidingWindow > 0,
+              arch.vocabSize > 0, arch.slidingWindow >= 0,
               arch.topKExperts > 0, arch.topKExperts <= arch.numExperts,
               arch.finalLogitSoftcap.isFinite,
               arch.ropeTheta.isFinite, arch.ropeTheta > 0,
@@ -205,7 +254,10 @@ package enum GTurboManifestCodec {
               arch.partialRotaryFactor >= 0, arch.partialRotaryFactor <= 1,
               !arch.hiddenActivation.isEmpty,
               arch.fullAttentionLayerMask.count == arch.numLayers,
-              arch.fullAttentionLayerMask.allSatisfy({ $0 == 0 || $0 == 1 }) else {
+              // 0 = sliding-window, 1 = full, 2 = gated-DeltaNet linear.
+              // Qwen 3.6 interleaves linear layers, so 2 has to be in the
+              // wire contract and not just in the runtime's interpretation.
+              arch.fullAttentionLayerMask.allSatisfy({ $0 <= 2 }) else {
             throw GTurboFormatError.invalid(
                 field: "manifest.arch", reason: "invalid architecture values")
         }
