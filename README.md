@@ -337,7 +337,7 @@ the layer's 16-slot LFU cache, then fills misses with bounded parallel `pread`
 calls into Metal-visible buffers. Metal computes the resident shared-expert
 branch while those reads run, then combines the shared and routed outputs.
 
-Prompt prefill uses chunks of up to 128 tokens so one fetched expert can serve
+Prompt prefill uses chunks of up to 256 tokens so one fetched expert can serve
 multiple rows. Generation repeats the routed layer loop one token at a time.
 The installer applies the same bounded-memory rule: it repacks remote ranges
 directly into `.gturbo` without staging a full shard or tensor.

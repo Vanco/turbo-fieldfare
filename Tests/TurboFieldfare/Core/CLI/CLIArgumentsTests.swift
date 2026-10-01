@@ -196,7 +196,7 @@ import TurboFieldfare
             ("--expert-cache-slots", "7"),
             ("--expert-cache-policy", "fifo"),
             ("--prefill", "yes"),
-            ("--prefill-chunk-tokens", "512"),
+            ("--prefill-chunk-tokens", "768"),
             ("--rdadvise", "automatic"),
         ]
         for (flag, value) in invalidValues {
@@ -225,9 +225,9 @@ import TurboFieldfare
         }
 
         arguments.expertCacheSlots = RuntimeConfiguration.production.expertCacheSlots
-        arguments.prefillChunkTokens = 512
+        arguments.prefillChunkTokens = 768
         #expect(throws: ArgsError.invalidValue(
-            flag: "--prefill-chunk-tokens", value: "512")) {
+            flag: "--prefill-chunk-tokens", value: "768")) {
             _ = try arguments.resolvedRuntimeConfiguration(forceLogitsHead: false)
         }
 

@@ -958,7 +958,7 @@ struct ServerArgumentTests {
         #expect(arguments.expertCacheSlots == 16)
         #expect(arguments.expertCachePolicy == .lfu)
         #expect(arguments.prefillPolicy == .chunked)
-        #expect(arguments.prefillChunkTokens == 128)
+        #expect(arguments.prefillChunkTokens == 256)
         #expect(arguments.rdadvisePolicy == .off)
         #expect(arguments.enableThinking == false)
     }
@@ -996,10 +996,10 @@ struct ServerArgumentTests {
 
         // Indistinguishable from the explicit cap, which is the whole claim:
         // the runtime identity is taken from the configuration, so a prefix
-        // built under `auto` is reusable by a run started at 256.
+        // built under `auto` is reusable by a run started at the cap.
         let explicitCap = try ServerArguments.parse([
             "--model", "model.gturbo",
-            "--prefill-chunk-tokens", "256",
+            "--prefill-chunk-tokens", "\(PrefillRuntimeConfig.maxChunkTokens)",
         ])
         #expect(try arguments.resolvedRuntimeConfiguration()
                 == (try explicitCap.resolvedRuntimeConfiguration()))
@@ -1105,7 +1105,7 @@ struct ServerArgumentTests {
         ["--expert-cache-slots", "12"],
         ["--expert-cache-policy", "mru"],
         ["--prefill", "maybe"],
-        ["--prefill-chunk-tokens", "512"],
+        ["--prefill-chunk-tokens", "768"],
         ["--prefill-chunk-tokens", "automatic"],
         ["--rdadvise", "eager"],
     ])
@@ -1147,7 +1147,7 @@ struct ServerArgumentTests {
          namesAuto: false),
         (flag: "--prefill-chunk-tokens",
          allowed: RuntimeConfiguration.allowedPrefillChunkTokens,
-         badValue: "512",
+         badValue: "768",
          namesAuto: true),
         (flag: "--prefill-chunk-tokens",
          allowed: RuntimeConfiguration.allowedPrefillChunkTokens,
@@ -1212,7 +1212,7 @@ struct ServerArgumentTests {
                                         expertCachePolicy: .lfu,
                                         expertStreamingMode: .pread(slotCount: 16),
                                         prefillPolicy: .off,
-                                        prefillChunkTokens: 512,
+                                        prefillChunkTokens: 768,
                                         rdadvisePolicy: .off,
                                         visionPack: nil,
                                         visionResidency: .onDemand,

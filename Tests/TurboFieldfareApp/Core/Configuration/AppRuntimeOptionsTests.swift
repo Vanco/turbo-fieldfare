@@ -9,14 +9,14 @@ import TurboFieldfare
         #expect(options.expertCacheSlots == 16)
         #expect(options.expertCachePolicy == .lfu)
         #expect(options.prefillEnabled)
-        #expect(options.prefillChunkTokens == 128)
+        #expect(options.prefillChunkTokens == 256)
         #expect(options.rdadvisePolicy == .off)
         #expect(options.modelVerification == .fullSha256)
 
         let runtime = try options.resolvedRuntimeConfiguration(forceLogitsHead: false)
         #expect(runtime == .production)
         #expect(options.resultSummary ==
-            "Cache 16 LFU, prefill 128, FP16 KV, RDADVISE off, full SHA-256")
+            "Cache 16 LFU, prefill 256, FP16 KV, RDADVISE off, full SHA-256")
     }
 
     @Test func everyPublicChoiceMapsToRuntime() throws {
@@ -61,7 +61,7 @@ import TurboFieldfare
             try AppRuntimeOptions(expertCacheSlots: 12).validate()
         }
         #expect(throws: AppInferenceError.self) {
-            try AppRuntimeOptions(prefillChunkTokens: 96).validate()
+            try AppRuntimeOptions(prefillChunkTokens: 768).validate()
         }
     }
 

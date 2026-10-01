@@ -170,7 +170,7 @@ extension Args {
                                  Chunked prefill requires 16 or more cache slots.
       --prefill-chunk-tokens <n|auto>
                                  Prefill chunk size: \(RuntimeConfiguration.allowedValueList(RuntimeConfiguration.allowedPrefillChunkTokens, alsoAccepting: ["auto"]))
-                                 (default 128). Each chunk re-reads the routed
+                                 (default 256). Each chunk re-reads the routed
                                  expert pool, so larger chunks read less; auto
                                  picks the smallest size that covers the prompt.
       --rdadvise <s>             Read-advice policy: off, default, bounded, or adaptive (default off).

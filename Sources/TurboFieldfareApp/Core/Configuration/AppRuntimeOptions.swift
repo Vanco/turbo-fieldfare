@@ -64,7 +64,7 @@ public struct AppRuntimeOptions: Equatable, Sendable {
     public init(expertCacheSlots: Int = 16,
                 expertCachePolicy: AppExpertCachePolicy = .lfu,
                 prefillEnabled: Bool = true,
-                prefillChunkTokens: Int = 128,
+                prefillChunkTokens: Int = 256,
                 rdadvisePolicy: AppRDAdvicePolicy = .off,
                 modelVerification: AppModelVerification = .fullSha256,
                 visionResidencyPolicy: VisionResidencyPolicy = .onDemand) {

@@ -65,16 +65,17 @@ defaults. See [Runtime controls](RUNTIME_CONTROLS.md) for what each one does.
 ```
 
 Without these flags the server runs the production defaults: 16 expert-cache
-slots, LFU eviction, chunked prefill on with 128-token chunks, read advice off,
+slots, LFU eviction, chunked prefill on with 256-token chunks, read advice off,
 and model thinking off. `--enable-thinking on` stops the prompt from pre-opening
 an empty thought channel, so the model reasons in `<|channel>thought` before its
 answer. The reasoning is returned as `reasoning_content` on the response message
 and in stream deltas; the visible answer stays in `content`. Thinking is off by
 default, and the setting changes the prompt tokens, so a prompt-cache entry built
 in one mode is never resumed in the other. `--prefill-chunk-tokens auto` runs at the cap,
-256, on the server: a per-request size is the smallest allowed size covering the
+1024, on the server: a per-request size is the smallest allowed size covering the
 span being prefilled, so the cap prefills every prompt in exactly those spans,
-and it costs about 32.5 MB of prefill scratch against about 16.4 MB at the 128
+and it costs about 128.8 MB of prefill scratch plus an FP16 KV ring of sliding
+window plus chunk, against about 32.5 MB and a 1,280-slot ring at the 256
 default. Values are validated before the model loads, so an unsupported one
 exits with the usage text rather than failing partway through startup. Chunked
 prefill needs at least 16 expert-cache slots, so `--expert-cache-slots 8`

@@ -220,19 +220,27 @@ public struct PrefillRuntimeConfig: Sendable, Equatable {
     /// Chunked prefill loops chunks outside layers, so each chunk streams that
     /// layer's experts again and read volume tracks chunk count and nothing
     /// else. On an 11,612-token prompt that meant 578 GB read from a 12 GB pool
-    /// with no cache hits at all.
+    /// with no cache hits at all. Doubling the chunk roughly halves both the
+    /// bytes read and the wall time: on a 10,333-token qwen36 prompt, 128/256/
+    /// 512/1024 measured 516/394/323/287s and 28.3/16.7/9.7/5.6 expert misses
+    /// per token. Misses fall in proportion to the chunk, wall time does not -
+    /// each miss costs more as the chunk grows, so the last doubling pays the
+    /// least.
     ///
-    /// 256 is free: the runner floors the chunk at
-    /// `VisionConfig().maximumPooledTokens` (280) for the KV ring and for the
-    /// multimodal scratch layout, so every size up to 280 produces byte-identical
-    /// geometry. 512 is the first size that costs anything, and raising this past
-    /// 280 should come with a test that asserts ring bytes the way
-    /// `PrefillChunkScratchTests` asserts scratch.
-    public static let maxChunkTokens = 256
+    /// Every size up to `VisionConfig().maximumPooledTokens` (280) is free: the
+    /// runner floors the chunk at that pooled-image span for the KV ring and
+    /// the multimodal scratch, so they all share byte-identical geometry. 512
+    /// and 1024 are the sizes that cost anything — they grow the FP16 KV ring
+    /// (`slidingWindow + chunk`) and the prefill scratch. `KVCacheManagerTests`
+    /// pins the ring bytes and `PrefillChunkScratchTests` pins the scratch,
+    /// so raising the cap has to move those tests too.
+    public static let maxChunkTokens = 1024
 
     /// Chunk sizes a caller may select. Capped at `maxChunkTokens` - see there
-    /// for why the larger sizes the scratch layout can handle are not offered.
-    public static let allowedChunkTokens = [32, 64, 128, 256]
+    /// for why the larger sizes are a real choice rather than always a win: the
+    /// first token of a reply still waits for the whole prompt, so a bigger
+    /// chunk is pure prefill-throughput and each doubling keeps paying less.
+    public static let allowedChunkTokens = [32, 64, 128, 256, 512, 1024]
 
     /// The largest selectable chunk no greater than `requested`.
     ///
@@ -278,7 +286,7 @@ public struct PrefillRuntimeConfig: Sendable, Equatable {
     }
 
     public static var defaultChunked: PrefillRuntimeConfig {
-        production(chunkTokens: 128)
+        production(chunkTokens: 256)
     }
 
     /// This config at a different chunk size, all other settings intact. The

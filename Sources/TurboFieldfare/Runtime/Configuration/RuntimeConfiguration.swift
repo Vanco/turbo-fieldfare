@@ -59,7 +59,7 @@ public struct RuntimeConfiguration: Sendable, Equatable {
                 expertCachePolicy: RuntimeExpertCachePolicy = .lfu,
                 rdadvisePolicy: RDAdvicePolicyMode = .off,
                 prefillEnabled: Bool = true,
-                prefillChunkTokens: Int = 128,
+                prefillChunkTokens: Int = 256,
                 prefillAttentionPath: RuntimePrefillAttentionPath = .fullTensorOps2DPreferred,
                 forceLogitsHead: Bool = false) {
         precondition(Self.allowedExpertCacheSlots.contains(expertCacheSlots),

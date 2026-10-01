@@ -12,7 +12,7 @@ public struct DecodeRuntimeOptions: Codable, Sendable, Equatable {
     public init(expertCacheSlots: Int = 16,
                 expertCachePolicy: String = "lfu",
                 prefillEnabled: Bool = true,
-                prefillChunkTokens: Int = 128,
+                prefillChunkTokens: Int = 256,
                 rdadvisePolicy: String = "off",
                 modelVerification: String = "full-sha256",
                 visionResidencyPolicy: String? = nil) {

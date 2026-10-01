@@ -53,13 +53,14 @@ public static let usage = """
                                  Chunked prefill requires 16 or more cache slots.
       --prefill-chunk-tokens <n|auto>
                                  Prefill chunk size: \(RuntimeConfiguration.allowedValueList(RuntimeConfiguration.allowedPrefillChunkTokens, alsoAccepting: ["auto"]))
-                                 (default 128). Each chunk re-reads the routed
+                                 (default 256). Each chunk re-reads the routed
                                  expert pool, so larger chunks read less; auto
-                                 runs at the cap, 256, which prefills every
+                                 runs at the cap, 1024, which prefills every
                                  prompt in the same spans a per-request size
                                  would. Prefill scratch is sized from the chunk,
-                                 so the cap holds about 32.5 MB of it against
-                                 16.4 MB at 128.
+                                 so the cap holds about 128.8 MB of it against
+                                 16.4 MB at 128; the FP16 KV ring also grows to
+                                 sliding-window + chunk (2048 tokens for Gemma 4).
       --rdadvise                 Read-advice policy: off, default, bounded, or adaptive
                                  (default off).
       --enable-thinking on|off   Let the model open a thought channel before its
@@ -118,7 +119,7 @@ public static let usage = """
         // the two flags appear in.
         var expertStreamingBackend = ExpertStreamingBackend.pread
         var prefillPolicy = RuntimePrefillPolicy.chunked
-        var prefillChunkTokens = 128
+        var prefillChunkTokens = 256
         var rdadvisePolicy = RDAdvicePolicyMode.off
         var enableThinking = false
         var index = 0

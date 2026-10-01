@@ -85,6 +85,41 @@ import Metal
         #expect(kv.keyBuffer(layer: 5, validTokenCount: 0).length == 4096 * 2048)
     }
 
+    @Test func fp16Ring_sizesForMaxPrefillChunkTokens() throws {
+        // Production passes max(maxChunkTokens, VisionConfig().maximumPooledTokens)
+        // to the KV manager, so at the new cap the Gemma 4 SWA ring is the 1,024
+        // sliding window plus the 1,024-token chunk. PrefillRuntimeConfig's
+        // comment promises a ring-bytes test like this: raising the cap has to
+        // move these numbers.
+        let ctx = try MetalContext()
+        let kv = try KVCacheManager(device: ctx.device,
+                                    config: config,
+                                    maxContext: 4096,
+                                    fp16RingEnabled: true,
+                                    slidingWindow: config.slidingWindow,
+                                    maxPrefillChunkTokens: PrefillRuntimeConfig.maxChunkTokens)
+
+        #expect(PrefillRuntimeConfig.maxChunkTokens == 1024)
+        let ringSlots = config.slidingWindow + PrefillRuntimeConfig.maxChunkTokens
+        #expect(kv.capacity(layer: 0) == ringSlots)
+        #expect(kv.ringCapacity(layer: 0) == ringSlots)
+        #expect(kv.keyBuffer(layer: 0, validTokenCount: 0).length == ringSlots * 8 * 256 * 2)
+        #expect(kv.valueBuffer(layer: 0, validTokenCount: 0).length == ringSlots * 8 * 256 * 2)
+        // Full layers stay linear to maxContext and are not part of the ring.
+        #expect(kv.capacity(layer: 5) == 4096)
+        #expect(kv.ringCapacity(layer: 5) == 0)
+        #expect(kv.keyBuffer(layer: 5, validTokenCount: 0).length == 4096 * 2 * 512 * 2)
+
+        let swaBytes = (0..<config.numLayers).reduce(0) { total, layer in
+            guard kv.layerKind(layer) == .swa else { return total }
+            return total
+                + kv.keyBuffer(layer: layer, validTokenCount: 0).length
+                + kv.valueBuffer(layer: layer, validTokenCount: 0).length
+        }
+        // 25 just-window layers at 2,048 slots x 4,096 B/slot in K and in V.
+        #expect(swaBytes == 25 * ringSlots * 4096 * 2)
+    }
+
     @Test func fp16Ring_shortSessionCapsSWAToMaxContext() throws {
         let (_, kv) = try makeManager(maxContext: 256,
                                       fp16RingEnabled: true)
