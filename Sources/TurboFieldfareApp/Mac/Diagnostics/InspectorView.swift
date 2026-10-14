@@ -94,8 +94,8 @@ struct InspectorView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             } else if case .unsupportedLayout = model.visionInstallationStatus {
-                Text("Image support needs a model directory named "
-                    + "“<name>.gturbo”, which is where the companion pack lives.")
+                Text("Image support needs a text model named “<name>.gturbo” "
+                    + "with “<name>.vision.gturbo” beside it.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if case .failed(let message) = model.visionInstallReadiness,
@@ -227,8 +227,10 @@ struct InspectorView: View {
                     .buttonStyle(.borderless)
                     .help("Copy model path")
                     .accessibilityIdentifier(.inspectorCopyPath)
+                    ModelLocationMenu(model: model)
                 }
             }
+            ModelLocationNotices(model: model)
             if model.canUnloadModel {
                 Button("Unload Model", action: model.unloadModel)
                     .accessibilityIdentifier(.inspectorUnload)
@@ -280,8 +282,6 @@ struct InspectorView: View {
                 }
             }
         }
-        .disabled(model.isRunning || model.isInstallingModel
-            || model.isVisionFilesystemMutationInProgress)
     }
 
     /// The context is settable only through the model, because changing it has
@@ -389,15 +389,15 @@ struct InspectorView: View {
         Section("Runtime") {
             Toggle("Prefill", isOn: $model.runtimeOptions.prefillEnabled)
                 .accessibilityIdentifier(.inspectorPrefill)
-            VStack(alignment: .leading, spacing: 8) {
-                Text("RDADVISE")
+            LabeledContent("RDADVISE") {
                 Picker("RDADVISE", selection: $model.runtimeOptions.rdadvisePolicy) {
                     ForEach(AppRDAdvicePolicy.allCases) { policy in
                         Text(policy.label).tag(policy)
                     }
                 }
-                .pickerStyle(.segmented)
+                .pickerStyle(.menu)
                 .labelsHidden()
+                .fixedSize()
                 .accessibilityIdentifier(.inspectorRDAdvise)
             }
             Text("RDADVISE is experimental. It may speed up short decodes but slow down long decodes.")
